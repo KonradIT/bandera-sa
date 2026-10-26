@@ -49,3 +49,54 @@
 
     return-object v0
 .end method
+
+# These accessors are used only by ConnectionService's analyzer presence/permission checks.
+# The USB serial driver must continue to see the real USB ids and descriptors.
+.method private static isC5(Landroid/hardware/usb/UsbDevice;)Z
+    .locals 2
+
+    const/4 v0, 0x0
+    if-eqz p0, :done
+    invoke-virtual {p0}, Landroid/hardware/usb/UsbDevice;->getVendorId()I
+    move-result v0
+    const/16 v1, 0x303a
+    if-ne v0, v1, :no
+    invoke-virtual {p0}, Landroid/hardware/usb/UsbDevice;->getProductId()I
+    move-result v0
+    const/16 v1, 0x1001
+    if-ne v0, v1, :no
+    const/4 v0, 0x1
+    return v0
+    :no
+    const/4 v0, 0x0
+    :done
+    return v0
+.end method
+
+.method public static analyzerVendor(Landroid/hardware/usb/UsbDevice;)I
+    .locals 1
+
+    invoke-static {p0}, Lua/bandera/bridge/Bridge;->isC5(Landroid/hardware/usb/UsbDevice;)Z
+    move-result v0
+    if-eqz v0, :real
+    const/16 v0, 0x483
+    return v0
+    :real
+    invoke-virtual {p0}, Landroid/hardware/usb/UsbDevice;->getVendorId()I
+    move-result v0
+    return v0
+.end method
+
+.method public static analyzerProduct(Landroid/hardware/usb/UsbDevice;)I
+    .locals 1
+
+    invoke-static {p0}, Lua/bandera/bridge/Bridge;->isC5(Landroid/hardware/usb/UsbDevice;)Z
+    move-result v0
+    if-eqz v0, :real
+    const/16 v0, 0x5740
+    return v0
+    :real
+    invoke-virtual {p0}, Landroid/hardware/usb/UsbDevice;->getProductId()I
+    move-result v0
+    return v0
+.end method

@@ -34,15 +34,27 @@ jobs:
 
       - name: Resolve inputs
         id: cfg
+        env:
+          INPUT_APK_URL: ${{ github.event.inputs.apk_url }}
         run: |
-          URL="${{ github.event.inputs.apk_url }}"
-          [ -z "$URL" ] && URL="${FRONTERA_APK_URL}"
-          if [ -z "$URL" ]; then
-            echo "::error::No APK URL. Set the FRONTERA_APK_URL repository variable or pass apk_url."
-            exit 1
-          fi
-          echo "apk_url=$URL" >> "$GITHUB_OUTPUT"
-          echo "short_sha=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+          python - <<'PY'
+          import os
+          from urllib.parse import urlsplit
+
+          url = os.environ.get("INPUT_APK_URL") or os.environ.get("FRONTERA_APK_URL", "")
+          if not url:
+              raise SystemExit("No APK URL. Set FRONTERA_APK_URL or pass apk_url.")
+          if any(ord(ch) <= 32 or ord(ch) == 127 for ch in url):
+              raise SystemExit("APK URL must not contain whitespace or control characters.")
+          parsed = urlsplit(url)
+          if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password:
+              raise SystemExit("APK URL must be HTTPS without embedded credentials.")
+          authenticated = parsed.hostname.lower() in {"github.com", "api.github.com"} and parsed.port in (None, 443)
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write(f"apk_url={url}\n")
+              output.write(f"github_auth={str(authenticated).lower()}\n")
+              output.write(f"short_sha={os.environ['GITHUB_SHA'][:7]}\n")
+          PY
 
       - name: Set up JDK
         uses: actions/setup-java@v4
@@ -67,12 +79,13 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           URL: ${{ steps.cfg.outputs.apk_url }}
+          GITHUB_AUTH: ${{ steps.cfg.outputs.github_auth }}
         run: |
-          # Send the token only to github.com (so private-repo release assets work; no leak elsewhere).
-          if echo "$URL" | grep -qi '://[^/]*github\.com/'; then
-            curl -fsSL -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/octet-stream" -o frontera.apk "$URL"
+          # Exact hosts only. curl strips Authorization on cross-host redirects.
+          if [ "$GITHUB_AUTH" = true ]; then
+            curl --proto '=https' --proto-redir '=https' -fsSL -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/octet-stream" -o frontera.apk "$URL"
           else
-            curl -fsSL -o frontera.apk "$URL"
+            curl --proto '=https' --proto-redir '=https' -fsSL -o frontera.apk "$URL"
           fi
           file frontera.apk; echo "Downloaded $(du -h frontera.apk | cut -f1)"
           head -c 2 frontera.apk | grep -q 'PK' || { echo "::error::Downloaded file is not an APK (check the URL / auth)"; exit 1; }
@@ -96,19 +109,27 @@ jobs:
       - name: Release
         env:
           GH_TOKEN: ${{ github.token }}
+          APK_URL: ${{ steps.cfg.outputs.apk_url }}
         run: |
           TAG="bandera-${{ steps.cfg.outputs.short_sha }}"
           PRE=""
           [ "${{ github.event.inputs.prerelease }}" = "true" ] && PRE="--prerelease"
-          NOTES="Bandera build from Frontera.
-          - Source commit: ${{ github.sha }}
-          - App versionName: ${{ steps.cfg.outputs.short_sha }} (versionCode ${{ github.run_number }})
-          - Patched from: ${{ steps.cfg.outputs.apk_url }}
-          Debug-signed; sideload only."
+          python - <<'PY'
+          import os
+          from pathlib import Path
+
+          sha = os.environ["GITHUB_SHA"]
+          Path("release-notes.txt").write_text(
+              "Bandera build from Frontera.\n"
+              f"- Source commit: {sha}\n"
+              f"- App versionName: {sha[:7]} (versionCode {os.environ['GITHUB_RUN_NUMBER']})\n"
+              f"- Patched from: {os.environ['APK_URL']}\n"
+              "Debug-signed; sideload only.\n", encoding="utf-8")
+          PY
           # Idempotent: drop any existing release/tag for this commit, then recreate.
           gh release delete "$TAG" --yes --cleanup-tag 2>/dev/null || true
           gh release create "$TAG" \
             "bandera-${{ steps.cfg.outputs.short_sha }}.apk" \
             --title "Bandera ${{ steps.cfg.outputs.short_sha }}" \
-            --notes "$NOTES" $PRE \
+            --notes-file release-notes.txt $PRE \
             --target "${{ github.sha }}"
