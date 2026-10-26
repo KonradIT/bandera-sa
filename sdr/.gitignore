@@ -1,0 +1,10 @@
+# Python venv and caches
+.venv/
+__pycache__/
+*.pyc
+
+# Capture output (recordings, logs, plots)
+captures/
+
+# Flatness calibration is per-device; regenerate with `bandera calibrate`.
+flatness.json

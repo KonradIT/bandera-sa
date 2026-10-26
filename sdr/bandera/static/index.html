@@ -1,0 +1,493 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>bandera live</title>
+<style>
+  :root {
+    --bg: #0f1115; --panel: #171a21; --line: #2a2f3a; --text: #e6e8ec; --muted: #8a919e;
+    --ok: #2fbf71; --warn: #f5a524; --alarm: #ff3b30; --accent: #4da3ff;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+         font: 14px/1.4 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  header { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 14px; padding: 10px 16px;
+           border-bottom: 1px solid var(--line); }
+  header h1 { font-size: 16px; margin: 0; font-weight: 600; }
+  .pill { padding: 2px 9px; border-radius: 999px; font-size: 12px; font-weight: 600; background: var(--line); }
+  .pill.live { background: #123d27; color: #7ee2a8; }
+  .pill.paused { background: #3d3212; color: #f5d27e; }
+  .pill.rec { background: #4a1414; color: #ff8a80; }
+  .pill.off { background: #3a1d1d; color: #ff8a80; }
+  .muted { color: var(--muted); }
+  main { padding: 12px 16px; display: grid; gap: 12px; }
+  #banner { padding: 14px 16px; border-radius: 10px; font-size: 20px; font-weight: 700; background: #133524;
+            color: #bff3d3; border: 1px solid #1e5a3b; }
+  #banner.possible { background: #3b2f10; color: #ffe2a3; border-color: #6b5417; }
+  #banner.alarm { background: #4d1010; color: #fff; border-color: var(--alarm); animation: pulse 1s infinite; }
+  #banner small { display: block; font-size: 13px; font-weight: 500; opacity: .85; margin-top: 2px; }
+  @keyframes pulse { 50% { background: #7a1414; } }
+  .controls { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+  .controls .group { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; padding: 6px 8px;
+                     background: var(--panel); border: 1px solid var(--line); border-radius: 8px; }
+  button, select, input { font: inherit; color: var(--text); background: #222733; border: 1px solid var(--line);
+                          border-radius: 6px; padding: 5px 9px; }
+  button { cursor: pointer; }
+  button:hover { border-color: var(--accent); }
+  button.on { background: #1d3a5c; border-color: var(--accent); }
+  button.danger.on { background: #5c1d1d; border-color: var(--alarm); }
+  input[type=number] { width: 70px; }
+  input.band { width: 120px; }
+  input.tag { width: 150px; }
+  label { display: inline-flex; gap: 4px; align-items: center; cursor: pointer; }
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; overflow: hidden; }
+  .panel h2 { margin: 0; padding: 7px 12px; font-size: 13px; font-weight: 600; color: var(--muted);
+              border-bottom: 1px solid var(--line); display: flex; justify-content: space-between; gap: 8px; }
+  canvas { display: block; width: 100%; }
+  #spec { height: 230px; }
+  #wf { height: 340px; }
+  .cols { display: grid; grid-template-columns: 3fr 2fr; gap: 12px; }
+  @media (max-width: 900px) { .cols { grid-template-columns: 1fr; } #wf { height: 260px; } #banner { font-size: 17px; } }
+  table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+  th, td { padding: 5px 10px; text-align: left; border-bottom: 1px solid var(--line); white-space: nowrap; }
+  th { color: var(--muted); font-weight: 500; font-size: 12px; }
+  .dot { display: inline-block; width: 9px; height: 9px; border-radius: 50%; margin-right: 6px; }
+  .swatch { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 5px; vertical-align: -1px; }
+  #log { max-height: 260px; overflow: auto; font-size: 13px; }
+  #log div { padding: 3px 12px; border-bottom: 1px solid var(--line); }
+  #log .confirmed { color: #ff9b94; }
+  #log .lost { color: var(--muted); }
+  #log .error { color: #ff6b6b; }
+  #log .warn { color: var(--warn); }
+  #windows { display: flex; flex-wrap: wrap; gap: 6px; padding: 8px 12px; font-size: 12px; }
+  #windows span { background: #222733; border-radius: 6px; padding: 3px 8px; }
+  .legend { display: flex; flex-wrap: wrap; gap: 4px 12px; font-size: 12px; font-weight: 400; }
+  .scroll { overflow-x: auto; }
+</style>
+</head>
+<body>
+<header>
+  <h1>bandera live</h1>
+  <span id="mode" class="pill">connecting…</span>
+  <span id="recpill" class="pill rec" hidden>● REC</span>
+  <span id="info" class="muted"></span>
+</header>
+<main>
+  <div id="banner">Connecting…</div>
+
+  <div class="controls">
+    <div class="group" id="presets"></div>
+    <div class="group">
+      <input class="band" id="band" placeholder="lo-hi MHz" title="Band in MHz, e.g. 2300-2550">
+      <button id="applyBand">Set band</button>
+    </div>
+    <div class="group">
+      <label title="Sweeps per analysis window (app default 16). 8 reacts faster with stricter thresholds.">W
+        <select id="w"><option>8</option><option>10</option><option>12</option><option>16</option></select></label>
+      <label>Gain <input type="number" id="gain" min="0" max="76" step="1"></label>
+      <label title="Per-window fixed gain, stepped down until no ADC overload"><input type="checkbox" id="auto"> auto</label>
+      <label title="Treat wifi as a drone class, like the app option"><input type="checkbox" id="wifi"> WiFi alerts</label>
+      <label title="Track and alert on everything in the 1800 MHz model window (app behaviour), not only the selected band"><input type="checkbox" id="whole"> whole window</label>
+    </div>
+    <div class="group">
+      <button id="run">Pause</button>
+      <button id="clear" title="Reset tracks and sweep buffers">Clear</button>
+      <button id="sound" title="Alarm beep (and vibration on phones) while a drone is confirmed">🔇 Sound off</button>
+    </div>
+    <div class="group">
+      <input class="tag" id="tag" placeholder="tag e.g. dji_mini4_50m">
+      <button id="rec" class="danger">● Record</button>
+    </div>
+    <div class="group">
+      <label><input type="checkbox" id="ambient" checked> ambient classes</label>
+      <label><input type="checkbox" id="marks" checked> marks</label>
+      <label title="Show the whole 1800 MHz model window instead of the selected band"><input type="checkbox" id="full"> show full window</label>
+    </div>
+  </div>
+
+  <div class="panel">
+    <h2><span>Spectrum (dB above noise floor) — boxes are the model's latest detections <span id="hidden" class="muted"></span></span>
+        <span class="legend" id="legend"></span></h2>
+    <canvas id="spec"></canvas>
+  </div>
+  <div class="panel">
+    <h2><span>Waterfall (newest on top, one row per sweep)</span><span id="wfinfo"></span></h2>
+    <canvas id="wf"></canvas>
+  </div>
+
+  <div class="cols">
+    <div class="panel">
+      <h2><span>Drone tracks</span><span class="muted" id="trackinfo"></span></h2>
+      <div class="scroll"><table>
+        <thead><tr><th>Status</th><th>Class</th><th>MHz</th><th>Score</th><th>Best</th><th>Hits</th><th>Age</th><th>Seen</th></tr></thead>
+        <tbody id="tracks"></tbody>
+      </table></div>
+    </div>
+    <div class="panel">
+      <h2><span>Events</span></h2>
+      <div id="log"></div>
+      <h2><span>Windows</span></h2>
+      <div id="windows"></div>
+    </div>
+  </div>
+</main>
+
+<script>
+"use strict";
+const COLORS = {
+  analog: "#ff3b30", dji: "#ff9f0a", autel: "#ffd60a", siyi: "#d070ff", wfb_ng: "#2ee6ff",
+  wifi: "#5b8cff", lte: "#9aa0a6", other_signals: "#6f7680", gnss: "#34c759",
+};
+const PRESETS = [
+  ["2.4 GHz", 2300, 2550], ["5.8 GHz", 5640, 5960], ["5.1–5.9", 5100, 5950],
+  ["1.2–1.3", 1080, 1360], ["900 MHz", 800, 1000], ["Full", 70, 6000],
+];
+const STEP = 3.0, WF_ROWS = 150, REL_MIN = -5, REL_MAX = 45;  // 150 rows ≈ 3 min at 1.3 s per sweep
+
+let state = null, view = null, cols = 0;
+let latest = null, peak = null;              // per display column, dB above floor
+const boxesByWin = {}, winInfo = {};
+let tracks = [], soundOn = false, audio = null, lastAlarmKey = "";
+const $ = (id) => document.getElementById(id);
+
+// ---------------------------------------------------------------- colour map (viridis-like)
+const LUT = (() => {
+  const stops = [[0, 13, 8, 35], [0.25, 59, 28, 140], [0.5, 33, 145, 140], [0.75, 94, 201, 98], [1, 253, 231, 37]];
+  const lut = new Uint8ClampedArray(256 * 3);
+  for (let i = 0; i < 256; i++) {
+    const x = i / 255;
+    let k = 0; while (k < stops.length - 2 && x > stops[k + 1][0]) k++;
+    const [x0, ...c0] = stops[k], [x1, ...c1] = stops[k + 1], t = (x - x0) / (x1 - x0);
+    for (let j = 0; j < 3; j++) lut[i * 3 + j] = c0[j] + (c1[j] - c0[j]) * t;
+  }
+  return lut;
+})();
+
+// ---------------------------------------------------------------- waterfall buffers
+const wf = document.createElement("canvas"), mk = document.createElement("canvas");
+const wfx = wf.getContext("2d", { willReadFrequently: true }), mkx = mk.getContext("2d");
+
+function resetView() {
+  const c = state.config;
+  const cover = [Math.min(...state.windows.map(w => w.start)), Math.max(...state.windows.map(w => w.stop)) + STEP];
+  let lo = c.band[0], hi = c.band[1];
+  if ($("full").checked || hi - lo > 1800 || state.mode === "replay") { lo = cover[0]; hi = cover[1]; }
+  lo = Math.max(lo, cover[0]); hi = Math.min(hi, cover[1]);
+  const s0 = state.windows[0].start;
+  lo = s0 + Math.floor((lo - s0) / STEP) * STEP;            // align columns to the sweep grid
+  cols = Math.max(1, Math.ceil((hi - lo) / STEP));
+  hi = lo + cols * STEP;
+  const key = `${lo}|${hi}`;
+  if (view && view.key === key) return;
+  view = { lo, hi, key };
+  latest = new Float32Array(cols).fill(NaN);
+  peak = new Float32Array(cols).fill(NaN);
+  for (const c of [wf, mk]) { c.width = cols; c.height = WF_ROWS; }
+  wfx.fillStyle = "#0d0d1a"; wfx.fillRect(0, 0, cols, WF_ROWS);
+  mkx.clearRect(0, 0, cols, WF_ROWS);
+  $("wfinfo").textContent = `${lo.toFixed(0)}–${hi.toFixed(0)} MHz · ${cols} bins of 3 MHz`;
+}
+
+function addRow(ev) {
+  // shift both buffers down one row; row 0 keeps the previous newest row so other windows carry forward
+  wfx.drawImage(wf, 0, 0, cols, WF_ROWS - 1, 0, 1, cols, WF_ROWS - 1);
+  mkx.globalCompositeOperation = "copy";  // replace, don't blend: translucent marks must not build up
+  mkx.drawImage(mk, 0, 0, cols, WF_ROWS - 1, 0, 1, cols, WF_ROWS - 1);
+  mkx.globalCompositeOperation = "source-over";
+  mkx.clearRect(0, 0, cols, 1);
+  const row = wfx.getImageData(0, 0, cols, 1);
+  for (let i = 0; i < ev.rel.length; i++) {
+    const f = ev.start + i * STEP;
+    if (f < view.lo || f >= view.hi) continue;
+    const c = Math.floor((f - view.lo) / STEP), v = ev.rel[i] / 10;
+    latest[c] = v;
+    peak[c] = Number.isNaN(peak[c]) ? v : Math.max(v, peak[c] - 0.3);
+    const idx = Math.max(0, Math.min(255, Math.round((v - REL_MIN) / (REL_MAX - REL_MIN) * 255))) * 3;
+    row.data[c * 4] = LUT[idx]; row.data[c * 4 + 1] = LUT[idx + 1]; row.data[c * 4 + 2] = LUT[idx + 2];
+    row.data[c * 4 + 3] = 255;
+  }
+  wfx.putImageData(row, 0, 0);
+  for (const b of ev.boxes) {             // translucent span + solid edges, so the signal stays visible
+    if (!b.target && !$("ambient").checked) continue;
+    const x0 = Math.round((b.lo - view.lo) / STEP), x1 = Math.round((b.hi - view.lo) / STEP);
+    if (x1 < 0 || x0 > cols) continue;
+    mkx.fillStyle = COLORS[b.cls] || "#fff";
+    mkx.globalAlpha = b.target ? 0.35 : 0.15;
+    mkx.fillRect(x0, 0, Math.max(1, x1 - x0), 1);
+    mkx.globalAlpha = 1;
+    mkx.fillRect(x0, 0, 1, 1);
+    mkx.fillRect(Math.max(x0, x1 - 1), 0, 1, 1);
+  }
+}
+
+// ---------------------------------------------------------------- drawing
+function fit(canvas) {
+  const dpr = window.devicePixelRatio || 1, r = canvas.getBoundingClientRect();
+  const w = Math.round(r.width * dpr), h = Math.round(r.height * dpr);
+  if (canvas.width !== w || canvas.height !== h) { canvas.width = w; canvas.height = h; }
+  return [canvas.getContext("2d"), w, h, dpr];
+}
+
+function freqTicks(lo, hi, px) {
+  const span = hi - lo, target = Math.max(2, Math.floor(px / 110));
+  const steps = [1, 2, 5, 10, 20, 25, 50, 100, 200, 250, 500, 1000];
+  const step = steps.find(s => span / s <= target) || 1000;
+  const out = [];
+  for (let f = Math.ceil(lo / step) * step; f <= hi; f += step) out.push(f);
+  return out;
+}
+
+let hover = null;
+function drawSpectrum() {
+  const [g, W, H, dpr] = fit($("spec"));
+  g.fillStyle = "#11141a"; g.fillRect(0, 0, W, H);
+  if (!view) return;
+  const pl = 34 * dpr, pb = 18 * dpr, pw = W - pl, ph = H - pb;
+  const X = (f) => pl + (f - view.lo) / (view.hi - view.lo) * pw;
+  const Y = (v) => ph - (v - REL_MIN) / (REL_MAX - REL_MIN) * ph;
+  g.font = `${11 * dpr}px system-ui`; g.lineWidth = 1;
+  for (let v = 0; v <= REL_MAX; v += 10) {
+    g.strokeStyle = "#232834"; g.beginPath(); g.moveTo(pl, Y(v)); g.lineTo(W, Y(v)); g.stroke();
+    g.fillStyle = "#6c7380"; g.fillText(String(v), 4 * dpr, Y(v) + 4 * dpr);
+  }
+  for (const f of freqTicks(view.lo, view.hi, pw / dpr)) {
+    g.strokeStyle = "#232834"; g.beginPath(); g.moveTo(X(f), 0); g.lineTo(X(f), ph); g.stroke();
+    const tw = g.measureText(String(f)).width;
+    if (X(f) + tw / 2 < W) { g.fillStyle = "#6c7380"; g.fillText(String(f), X(f) - tw / 2, H - 4 * dpr); }
+  }
+  // detection boxes (latest per window), ambient first so targets draw on top
+  const shown = Object.values(boxesByWin).flat().filter(b => b.target || $("ambient").checked);
+  const outside = shown.filter(b => b.hi <= view.lo || b.lo >= view.hi);
+  $("hidden").textContent = outside.length
+    ? `· ${outside.length} outside this view (${[...new Set(outside.map(b => b.cls))].join(", ")}) — tick "show full window"` : "";
+  const all = shown.filter(b => !outside.includes(b))
+    .sort((a, b) => (a.target - b.target) || (a.score - b.score));
+  for (const b of all) {
+    const x0 = Math.max(pl, X(b.lo)), x1 = Math.min(W, X(b.hi));
+    if (x1 <= x0) continue;
+    const col = COLORS[b.cls] || "#fff";
+    g.globalAlpha = (b.target ? 0.28 : 0.13) * (b.in_band ? 1 : 0.5); g.fillStyle = col; g.fillRect(x0, 0, x1 - x0, ph);
+    g.globalAlpha = b.in_band ? 1 : 0.6; g.strokeStyle = col; g.lineWidth = (b.target ? 2 : 1) * dpr;
+    g.setLineDash(b.in_band ? [] : [4 * dpr, 4 * dpr]);    // dashed: outside the band, not tracked
+    g.strokeRect(x0, 1, x1 - x0, ph - 2);
+    g.setLineDash([]); g.globalAlpha = 1;
+  }
+  // labels packed into rows (targets first) so overlapping boxes stay readable
+  const rowEnds = [];
+  for (const b of [...all].reverse()) {
+    const x0 = Math.max(pl, X(b.lo));
+    if (Math.min(W, X(b.hi)) <= x0) continue;
+    g.font = `${(b.target ? 12 : 11) * dpr}px system-ui`;
+    const text = `${b.cls} ${b.score.toFixed(2)}`, tw = g.measureText(text).width;
+    let row = rowEnds.findIndex(end => end < x0);
+    if (row < 0) { if (rowEnds.length >= 5) continue; row = rowEnds.length; rowEnds.push(0); }
+    rowEnds[row] = x0 + tw + 8 * dpr;
+    g.fillStyle = COLORS[b.cls] || "#fff";
+    g.fillText(text, x0 + 3 * dpr, (14 + row * 14) * dpr);
+  }
+  g.lineWidth = 1;
+  const line = (arr, color, width) => {
+    g.strokeStyle = color; g.lineWidth = width * dpr; g.beginPath();
+    let pen = false;
+    for (let c = 0; c < cols; c++) {
+      const v = arr[c];
+      if (Number.isNaN(v)) { pen = false; continue; }
+      const x = X(view.lo + (c + 0.5) * STEP), y = Y(Math.max(REL_MIN, Math.min(REL_MAX, v)));
+      if (pen) g.lineTo(x, y); else { g.moveTo(x, y); pen = true; }
+    }
+    g.stroke();
+  };
+  line(peak, "#5a6170", 1);
+  line(latest, "#7fd4ff", 1.4);
+  if (hover !== null) {
+    const f = view.lo + (hover - pl) / pw * (view.hi - view.lo);
+    if (f >= view.lo && f < view.hi) {
+      const c = Math.floor((f - view.lo) / STEP), v = latest[c];
+      g.strokeStyle = "#ffffff55"; g.beginPath(); g.moveTo(hover, 0); g.lineTo(hover, ph); g.stroke();
+      g.fillStyle = "#fff"; g.font = `${12 * dpr}px system-ui`;
+      const txt = `${f.toFixed(0)} MHz  ${Number.isNaN(v) ? "–" : v.toFixed(1) + " dB"}`;
+      g.fillText(txt, Math.min(hover + 6 * dpr, W - 130 * dpr), ph - 8 * dpr);
+    }
+  }
+}
+
+function drawWaterfall() {
+  const [g, W, H] = fit($("wf"));
+  g.fillStyle = "#0d0d1a"; g.fillRect(0, 0, W, H);
+  if (!view) return;
+  g.imageSmoothingEnabled = cols > W;
+  g.drawImage(wf, 0, 0, cols, WF_ROWS, 0, 0, W, H);
+  if ($("marks").checked) { g.globalAlpha = 0.85; g.imageSmoothingEnabled = false; g.drawImage(mk, 0, 0, cols, WF_ROWS, 0, 0, W, H); g.globalAlpha = 1; }
+}
+
+let pending = false;
+function redraw() {
+  if (pending) return;
+  pending = true;
+  requestAnimationFrame(() => { pending = false; drawSpectrum(); drawWaterfall(); });
+}
+
+// ---------------------------------------------------------------- panels
+const fmtAge = (s) => s < 90 ? `${Math.round(s)} s` : `${Math.floor(s / 60)} min`;
+function renderTracks() {
+  const now = Date.now() / 1000;
+  const rows = [...tracks].sort((a, b) => (b.confirmed - a.confirmed) || (b.score - a.score));
+  $("tracks").innerHTML = rows.map(t => `
+    <tr><td><span class="dot" style="background:${t.confirmed ? "var(--alarm)" : "var(--warn)"}"></span>${t.confirmed ? (t.instant ? "CONFIRMED (instant)" : "CONFIRMED") : "possible"}</td>
+    <td><span class="swatch" style="background:${COLORS[t.cls]}"></span>${t.cls}</td>
+    <td>${t.lo.toFixed(0)}–${t.hi.toFixed(0)}</td><td>${t.score.toFixed(2)}</td><td>${t.best.toFixed(2)}</td>
+    <td>${t.hits}</td><td>${fmtAge(now - t.first_t)}</td><td>${fmtAge(Math.max(0, now - t.last_t))} ago</td></tr>`).join("")
+    || `<tr><td colspan="8" class="muted">no drone-class tracks</td></tr>`;
+  $("trackinfo").textContent = state ? `targets: ${state.targets.join(", ")}` : "";
+  renderBanner();
+}
+
+function renderBanner() {
+  const b = $("banner"), conf = tracks.filter(t => t.confirmed), poss = tracks.filter(t => !t.confirmed);
+  const now = Date.now() / 1000;
+  const stale = (t) => now - t.last_t > 4 ? ` · last seen ${Math.round(now - t.last_t)} s ago` : "";  // ages out after 2W visits
+  const desc = (t) => `${t.cls.toUpperCase()} ${t.lo.toFixed(0)}–${t.hi.toFixed(0)} MHz (${t.score.toFixed(2)})${stale(t)}`;
+  if (conf.length) {
+    b.className = "alarm";
+    b.innerHTML = `DRONE SIGNAL: ${conf.map(desc).join(" · ")}` + (poss.length ? `<small>also possible: ${poss.map(desc).join(" · ")}</small>` : "");
+  } else if (poss.length) {
+    b.className = "possible";
+    b.innerHTML = `Possible: ${poss.map(desc).join(" · ")}<small>waiting for a second hit or a score ≥ 0.5</small>`;
+  } else {
+    b.className = "";
+    const filling = state ? state.windows.filter(w => (winInfo[w.index]?.fill ?? w.fill) < state.config.w) : [];
+    b.innerHTML = filling.length
+      ? `Warming up — ${filling.map(w => `${w.start.toFixed(0)}: ${winInfo[w.index]?.fill ?? w.fill}/${state.config.w}`).join(", ")} sweeps<small>the model needs W sweeps of a window before it can detect</small>`
+      : `Clear — no drone signals`;
+  }
+}
+
+function logLine(text, cls = "", t = null) {
+  const d = document.createElement("div");
+  d.className = cls; d.textContent = `${(t ? new Date(t * 1000) : new Date()).toLocaleTimeString()}  ${text}`;
+  $("log").prepend(d);
+  while ($("log").childElementCount > 200) $("log").lastChild.remove();
+}
+
+function renderWindows() {
+  if (!state) return;
+  $("windows").innerHTML = state.windows.map(w => {
+    const i = winInfo[w.index] || {};
+    const ovl = i.overload > 1e-3 ? ` · <b style="color:var(--alarm)">overload ${i.overload.toExponential(1)}</b>` : "";
+    return `<span>${w.start.toFixed(0)}–${w.stop.toFixed(0)} MHz · gain ${w.gain.toFixed(0)} · fill ${i.fill ?? w.fill}/${state.config.w}` +
+      (i.sweep_s ? ` · ${i.sweep_s.toFixed(2)} s · floor ${i.floor_db.toFixed(1)} dB` : "") +
+      (i.image_fixes ? ` · mirror fixes ${i.image_fixes}` : "") + `${ovl}</span>`;
+  }).join("");
+}
+
+function renderHeader() {
+  if (!state) return;
+  const m = $("mode");
+  m.className = "pill " + (state.running ? "live" : "paused");
+  m.textContent = (state.mode === "replay" ? "REPLAY " : "") + (state.running ? "SCANNING" : "PAUSED");
+  $("run").textContent = state.running ? "Pause" : "Start";
+  $("recpill").hidden = !state.recording;
+  $("rec").classList.toggle("on", state.recording);
+  $("rec").textContent = state.recording ? "■ Stop recording" : "● Record";
+  const c = state.config, d = state.device || {};
+  $("info").textContent = `${d.mboard || ""} ${d.serial || d.file || ""} · band ${c.band[0]}–${c.band[1]} MHz · W=${c.w}`;
+}
+
+function syncControls() {
+  const c = state.config;
+  $("w").value = String(c.w); $("gain").value = c.gain; $("auto").checked = c.auto_gain;
+  $("wifi").checked = c.detect_wifi; $("whole").checked = c.whole_window; $("band").value = `${c.band[0]}-${c.band[1]}`;
+  for (const btn of $("presets").children) btn.classList.toggle("on", btn.dataset.band === `${c.band[0]}-${c.band[1]}`);
+}
+
+// ---------------------------------------------------------------- alarm
+function beep(ms = 400, freq = 880) {
+  if (!audio) return;
+  const o = audio.createOscillator(), g = audio.createGain();
+  o.frequency.value = freq; o.type = "square"; g.gain.value = 0.08;
+  o.connect(g).connect(audio.destination); o.start(); o.stop(audio.currentTime + ms / 1000);
+}
+setInterval(() => {            // like the app: 400 ms every second while a drone is confirmed
+  if (soundOn && tracks.some(t => t.confirmed)) { beep(); navigator.vibrate?.(400); }
+}, 1000);
+setInterval(() => { renderTracks(); }, 2000);
+
+function notify(t) {
+  if ("Notification" in window && Notification.permission === "granted")
+    new Notification("Drone signal", { body: `${t.cls.toUpperCase()} ${t.lo.toFixed(0)}–${t.hi.toFixed(0)} MHz, score ${t.score.toFixed(2)}` });
+}
+
+// ---------------------------------------------------------------- server I/O
+async function post(path, body) {
+  const r = await fetch(path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+  if (!r.ok) logLine(`error: ${(await r.json()).error}`, "error");
+}
+const sendConfig = (extra = {}) => post("/api/config", {
+  w: +$("w").value, gain: +$("gain").value, auto_gain: $("auto").checked, detect_wifi: $("wifi").checked,
+  whole_window: $("whole").checked, ...extra,
+});
+
+const es = new EventSource("/events");
+es.addEventListener("state", (e) => {
+  const prev = state;
+  state = JSON.parse(e.data);
+  const changed = !prev || JSON.stringify(prev.windows.map(w => w.start)) !== JSON.stringify(state.windows.map(w => w.start))
+    || prev.config.band.join() !== state.config.band.join();
+  if (changed) { view = null; for (const k in boxesByWin) delete boxesByWin[k]; for (const k in winInfo) delete winInfo[k]; tracks = []; }
+  resetView(); syncControls(); renderHeader(); renderWindows(); renderTracks(); redraw();
+});
+es.addEventListener("sweep", (e) => {
+  if (!state || !view) return;
+  const ev = JSON.parse(e.data);
+  if (!state.windows.some(w => w.index === ev.window && w.start === ev.start)) return;  // stale, from a previous plan
+  winInfo[ev.window] = ev;
+  boxesByWin[ev.window] = ev.boxes;
+  tracks = ev.tracks;
+  addRow(ev);
+  const fresh = Date.now() / 1000 - ev.t < 15;   // sweeps replayed on (re)connect must not re-alert
+  for (const x of ev.events) {
+    if (x.kind === "confirmed") {
+      logLine(`CONFIRMED ${x.cls} ${x.lo.toFixed(0)}–${x.hi.toFixed(0)} MHz score ${x.score.toFixed(2)}${x.instant ? " (instant)" : ""}`, "confirmed", ev.t);
+      if (fresh) notify(x);
+    } else if (x.kind === "lost") logLine(`lost ${x.cls} ~${x.center.toFixed(0)} MHz (best ${x.best.toFixed(2)})`, "lost", ev.t);
+    else if (x.kind === "new" && soundOn && fresh) beep(80, 1320);
+  }
+  renderTracks(); renderWindows(); redraw();
+});
+es.addEventListener("status", (e) => { const s = JSON.parse(e.data); logLine(s.msg, s.level, s.t); });
+es.onerror = () => { $("mode").className = "pill off"; $("mode").textContent = "DISCONNECTED"; };
+
+// ---------------------------------------------------------------- controls
+for (const [name, lo, hi] of PRESETS) {
+  const b = document.createElement("button");
+  b.textContent = name; b.dataset.band = `${lo}-${hi}`;
+  b.onclick = () => sendConfig({ band: [lo, hi] });
+  $("presets").append(b);
+}
+$("applyBand").onclick = () => {
+  const m = $("band").value.replace(/\s/g, "").match(/^(\d+(?:\.\d+)?)-(\d+(?:\.\d+)?)$/);
+  if (!m) return logLine("band must look like 2300-2550", "error");
+  sendConfig({ band: [+m[1], +m[2]] });
+};
+for (const id of ["w", "gain", "auto", "wifi", "whole"]) $(id).onchange = () => sendConfig();
+$("run").onclick = () => post("/api/control", { op: state && state.running ? "pause" : "start" });
+$("clear").onclick = () => { post("/api/control", { op: "clear" }); tracks = []; peak?.fill(NaN); renderTracks(); redraw(); };
+$("rec").onclick = () => post("/api/control", { op: "record", on: !(state && state.recording), tag: $("tag").value });
+$("sound").onclick = () => {
+  soundOn = !soundOn;
+  if (soundOn && !audio) audio = new (window.AudioContext || window.webkitAudioContext)();
+  if (soundOn && "Notification" in window && Notification.permission === "default") Notification.requestPermission();
+  $("sound").textContent = soundOn ? "🔊 Sound on" : "🔇 Sound off";
+  $("sound").classList.toggle("on", soundOn);
+  if (soundOn) beep(120, 660);
+};
+for (const id of ["ambient", "marks"]) $(id).onchange = redraw;
+$("full").onchange = () => { view = null; resetView(); redraw(); };
+$("spec").onmousemove = (e) => { hover = e.offsetX * (window.devicePixelRatio || 1); redraw(); };
+$("spec").onmouseleave = () => { hover = null; redraw(); };
+window.onresize = redraw;
+$("legend").innerHTML = Object.entries(COLORS).map(([k, c]) => `<span><span class="swatch" style="background:${c}"></span>${k}</span>`).join("");
+</script>
+</body>
+</html>

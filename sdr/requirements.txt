@@ -1,0 +1,3 @@
+# Runtime for the extracted TFLite graphs. UHD 4.9 Python bindings, numpy 1.26, scipy and
+# matplotlib come from the system Python (venv created with --system-site-packages).
+ai-edge-litert==2.3.0
