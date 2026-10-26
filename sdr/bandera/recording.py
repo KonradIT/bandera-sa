@@ -2,7 +2,7 @@
 
 Layout follows the APK's dataset_regions export (raw binned levels, start/stop/step, sdr_device,
 boxes [{lo_mhz, hi_mhz, label}]) so recordings can be labelled the same way. Levels here are
-B210 dB (power relative to full scale at the given gain), not calibrated dBm; the model only
+SDR dB (power relative to full scale at the given gain), not calibrated dBm; the model only
 sees floor-relative values, so the absolute offset does not matter to it.
 """
 from __future__ import annotations
@@ -37,7 +37,7 @@ class WindowRecorder:
             "step_mhz": STEP_MHZ,
             "n_bins": N_BINS,
             "n_sweeps": 0,
-            "units": "dB re B210 full scale (uncalibrated)",
+            "units": "dB re SDR full scale (uncalibrated unless a measured level offset was supplied)",
             "tag": tag,
             "sdr_device": device,
             "model": MODEL_TAG,
@@ -45,6 +45,8 @@ class WindowRecorder:
             "sweep_t": [],
             "sweep_duration_s": [],
             "overload_frac": [],
+            "bad_bursts": [],
+            "sweep_extra": [],
             "boxes": [],
         }
         self.flush_every = flush_every
@@ -54,6 +56,8 @@ class WindowRecorder:
         self.meta["sweep_t"].append(round(result.t_start, 3))
         self.meta["sweep_duration_s"].append(round(result.duration_s, 3))
         self.meta["overload_frac"].append(float(f"{result.overload_frac:.3g}"))
+        self.meta["bad_bursts"].append(int(result.bad_bursts))
+        self.meta["sweep_extra"].append(dict(result.extra))
         if len(self.rows) % self.flush_every == 0:
             self.flush()
 
@@ -72,4 +76,17 @@ def load_recording(path: Path) -> tuple[np.ndarray, dict]:
     sweeps = np.load(path)
     side = path.with_suffix(".json")
     meta = json.loads(side.read_text()) if side.exists() else {}
+    if sweeps.ndim != 2 or sweeps.shape[1] != N_BINS or len(sweeps) == 0:
+        raise ValueError(f"recording must contain one or more {N_BINS}-point sweeps")
+    for key in ("overload_frac", "bad_bursts", "sweep_extra"):
+        if key in meta and len(meta[key]) != len(sweeps):
+            raise ValueError(f"recording {key} metadata length does not match sweeps")
     return sweeps.astype(np.float32), meta
+
+
+def valid_sweep_mask(sweeps: np.ndarray, meta: dict, overload_limit: float) -> np.ndarray:
+    """Quality mask shared by offline replay and plots; old files default clean."""
+    overload = np.asarray(meta.get("overload_frac", np.zeros(len(sweeps))), dtype=float)
+    bad = np.asarray(meta.get("bad_bursts", np.zeros(len(sweeps))), dtype=float)
+    return (np.isfinite(sweeps).all(axis=1) & np.isfinite(overload) & (overload >= 0) &
+            (overload <= overload_limit) & (bad == 0))

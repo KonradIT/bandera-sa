@@ -2,11 +2,12 @@
 
 A Scanner owns the window plan, one ring buffer of W sweeps per window, the tracker and any
 recorders. Each step() sweeps the next window round-robin and returns a JSON-ready dict.
-Sources: B210Sweeper (live) or ReplaySource (recorded .npy, same interface).
+Sources: UHD sweepers (live) or ReplaySource (recorded .npy, same interface).
 """
 from __future__ import annotations
 
 import collections
+import math
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -35,12 +36,12 @@ class ScanConfig:
 
     def validated(self) -> "ScanConfig":
         lo, hi = (float(x) for x in self.band)
-        if not (0 < lo < hi <= 13000):
+        if not (math.isfinite(lo) and math.isfinite(hi) and 0 <= lo < hi):
             raise ValueError(f"bad band {lo}-{hi}")
         if int(self.w) not in SUPPORTED_W:
             raise ValueError(f"W must be one of {SUPPORTED_W}")
-        if not 0 <= float(self.gain) <= 76:
-            raise ValueError("gain must be 0-76 dB")
+        if not math.isfinite(float(self.gain)):
+            raise ValueError("gain must be finite")
         return ScanConfig((lo, hi), int(self.w), float(self.gain), bool(self.auto_gain), bool(self.detect_wifi),
                           bool(self.whole_window))
 
@@ -54,6 +55,9 @@ class ReplaySource:
     def __init__(self, path: Path, speed: float = 1.0, loop: bool = True):
         self.path = Path(path)
         self.rows, meta = load_recording(self.path)
+        self.overload = meta.get("overload_frac", [0.0] * len(self.rows))
+        self.bad_bursts = meta.get("bad_bursts", [0] * len(self.rows))
+        self.extra = meta.get("sweep_extra", [{}] * len(self.rows))
         self.start_mhz = float(meta.get("start_mhz", 0.0))
         durations = meta.get("sweep_duration_s") or [1.3]
         self.period = float(np.median(durations)) / max(speed, 1e-3)
@@ -75,13 +79,15 @@ class ReplaySource:
             self.i = 0
         t0 = time.time()
         time.sleep(self.period)
-        row = self.rows[self.i]
+        index = self.i
+        row = self.rows[index]
         self.i += 1
-        return SweepResult(self.start_mhz, row, t0, self.period, 0.0, 0)
+        return SweepResult(self.start_mhz, row, t0, self.period,
+                           self.overload[index], self.bad_bursts[index], self.extra[index])
 
 
 class LiveSource:
-    """Adapter giving B210Sweeper the source interface (plan + sweep + gain)."""
+    """Adapter giving a UHD sweeper the source interface (plan + sweep + gain)."""
 
     def __init__(self, sweeper):
         self.sweeper = sweeper
@@ -92,7 +98,9 @@ class LiveSource:
         return self.sweeper.gain
 
     def plan(self, lo: float, hi: float) -> list[Window]:
-        return plan_windows(lo, hi)
+        if hasattr(self.sweeper, "plan"):
+            return self.sweeper.plan(lo, hi)
+        return plan_windows(lo, hi, self.sweeper.freq_min_mhz, self.sweeper.freq_max_mhz)
 
     def set_gain(self, gain: float) -> None:
         self.sweeper.set_gain(gain)
@@ -128,12 +136,18 @@ class Scanner:
 
     def configure(self, config: ScanConfig) -> None:
         config = config.validated()
+        planned = self.source.plan(*config.band)
+        gain_range = self.source.info.get("gain_range_db")
+        if gain_range and not gain_range[0] <= config.gain <= gain_range[1]:
+            raise ValueError(f"gain must be {gain_range[0]:g}-{gain_range[1]:g} dB for this RX frontend")
         self._close_recorders()
         self.config = config
         self.tracker = Tracker(config.w, detect_wifi=config.detect_wifi)
         self.windows = []
-        for win in self.source.plan(*config.band):
+        for win in planned:
             gain = self._auto_gain(win) if config.auto_gain else config.gain
+            self.source.set_gain(gain)
+            gain = self.source.gain
             self.windows.append(WindowState(win, gain, collections.deque(maxlen=config.w)))
         self._next = 0
         if self.rec_dir is not None:
@@ -141,12 +155,16 @@ class Scanner:
 
     def _auto_gain(self, win: Window) -> float:
         g = self.config.gain
+        minimum = self.source.info.get("gain_range_db", [0.0, 76.0])[0]
         while True:
             self.source.set_gain(g)
             worst = max(self.source.sweep(win.start_mhz).overload_frac for _ in range(2))
-            if worst <= AUTO_GAIN_OK or g <= 0:
+            if worst <= AUTO_GAIN_OK or g <= minimum:
                 break
-            g = max(0.0, g - AUTO_GAIN_STEP_DB)
+            next_gain = max(minimum, g - AUTO_GAIN_STEP_DB)
+            if next_gain == g:
+                break
+            g = next_gain
         self.status(f"auto-gain [{win.label()}]: {self.source.gain:.0f} dB (overload {worst:.1e})")
         return self.source.gain
 
@@ -200,19 +218,31 @@ class Scanner:
         if self.source.gain != ws.gain:
             self.source.set_gain(ws.gain)
         r = self.source.sweep(win.start_mhz)
+        if np.asarray(r.db).shape != (N_BINS,):
+            raise ValueError(f"source returned {np.asarray(r.db).shape}, expected ({N_BINS},)")
         ws.visits += 1
         ws.last_sweep_s, ws.last_overload = r.duration_s, r.overload_frac
-        ws.buffer.append(r.db)
+        accepted = (r.bad_bursts == 0 and math.isfinite(r.overload_frac) and
+                    0 <= r.overload_frac <= OVERLOAD_WARN and np.isfinite(r.db).all())
+        if accepted:
+            ws.buffer.append(r.db)
+        else:
+            # The encoder needs consecutive undistorted sweeps. Bridging a bad
+            # row changes its temporal statistics just as feeding clipping does.
+            ws.buffer.clear()
         if ws.recorder is not None:
             ws.recorder.add(r)
-        rows = np.asarray(ws.buffer)
+        display_db = np.nan_to_num(r.db, nan=-120.0, posinf=-120.0, neginf=-120.0)
+        rows = np.asarray(ws.buffer) if ws.buffer else np.asarray([display_db])
         floor = instrument_floor(np.median(rows, axis=0))
         boxes, events = [], []
-        if len(rows) >= w:
+        if accepted and len(ws.buffer) >= w:
             _, boxes = self.model.detect(rows, win.start_mhz, w)
             boxes = merge_boxes([b for b in boxes if win.owns(b.center_mhz)])
             tracked = [b for b in boxes if self.config.in_band(b.center_mhz)]
             events = self.tracker.update(win.index, ws.visits, tracked, now=r.t_start)
+        else:
+            events = self.tracker.update(win.index, ws.visits, [], now=r.t_start)
         ws.last_boxes = boxes
         targets = self.tracker.classes
         return {
@@ -220,14 +250,16 @@ class Scanner:
             "window": win.index,
             "start": win.start_mhz,
             "visit": ws.visits,
-            "fill": len(rows),
+            "fill": len(ws.buffer),
+            "accepted": bool(accepted),
+            "bad_bursts": r.bad_bursts,
             "w": w,
             "gain": ws.gain,
             "sweep_s": round(r.duration_s, 3),
             "overload": float(f"{r.overload_frac:.3g}"),
             "floor_db": round(float(np.median(floor)), 1),
             "image_fixes": int(r.extra.get("image_points", 0)),
-            "rel": np.round((r.db - floor) * 10).astype(int).tolist(),  # 0.1 dB above the noise floor
+            "rel": np.round((display_db - floor) * 10).astype(int).tolist(),  # 0.1 dB above the noise floor
             "boxes": [{"cls": b.cls, "lo": round(b.lo_mhz, 1), "hi": round(b.hi_mhz, 1),
                        "score": round(b.score, 3), "target": b.cls in targets,
                        "in_band": self.config.in_band(b.center_mhz)} for b in boxes],

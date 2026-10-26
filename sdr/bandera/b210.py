@@ -23,6 +23,7 @@ again with the LO moved 24 MHz, which moves their mirror 48 MHz away, and the cl
 from __future__ import annotations
 
 import json
+import math
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -130,25 +131,46 @@ class B210Sweeper:
     def __init__(self, args: str = "type=b200", gain: float = 60.0, antenna: str = "RX2",
                  channel: int = 0, readings: int = 24, settle_us: float = 100.0,
                  averaging: str = "log", level_offset_db: float = 0.0, flatten: bool = True,
-                 image_check: bool = True):
+                 image_check: bool = True, _usrp=None):
         import uhd
 
         self.uhd = uhd
         dev_args = f"{args},master_clock_rate={MCR:.0f},num_recv_frames=2048,recv_frame_size=16360"
-        self.usrp = uhd.usrp.MultiUSRP(dev_args)
+        self.usrp = _usrp if _usrp is not None else uhd.usrp.MultiUSRP(dev_args)
+        if not 0 <= channel < self.usrp.get_rx_num_channels():
+            raise ValueError(f"RX channel {channel} does not exist")
+        if readings <= 0 or not math.isfinite(settle_us) or settle_us < 0:
+            raise ValueError("readings must be positive and settle time must be finite and nonnegative")
+        if averaging not in ("log", "lin"):
+            raise ValueError("averaging must be log or lin")
+        if not math.isfinite(level_offset_db):
+            raise ValueError("level offset must be finite")
+        self.gain_min_db = float(self.usrp.get_rx_gain_range(channel).start())
+        self.gain_max_db = float(self.usrp.get_rx_gain_range(channel).stop())
+        if not math.isfinite(gain) or not self.gain_min_db <= gain <= self.gain_max_db:
+            raise ValueError(f"gain must be {self.gain_min_db:g}-{self.gain_max_db:g} dB")
+        available = list(self.usrp.get_rx_antennas(channel))
+        if antenna not in available:
+            raise ValueError(f"antenna {antenna!r} is unavailable; choose {available}")
+        self.freq_min_mhz, self.freq_max_mhz = FREQ_MIN_MHZ, FREQ_MAX_MHZ
+        self.freq_ranges_mhz = [(self.freq_min_mhz, self.freq_max_mhz)]
         self.ch = channel
         self.usrp.set_rx_rate(FS, channel)
         self.usrp.set_rx_bandwidth(56e6, channel)
+        if not math.isclose(self.usrp.get_rx_rate(channel), FS, rel_tol=1e-6):
+            raise ValueError("B210 profile requires exactly 28 MS/s; use --profile generic")
         self.usrp.set_rx_antenna(antenna, channel)
         self.usrp.set_rx_gain(gain, channel)
-        self.stream = self.usrp.get_rx_stream(uhd.usrp.StreamArgs("fc32", "sc16"))
+        stream_args = uhd.usrp.StreamArgs("fc32", "sc16")
+        stream_args.channels = [channel]
+        self.stream = self.usrp.get_rx_stream(stream_args)
         self.md = uhd.types.RXMetadata()
         self.readings = readings
         self.averaging = averaging
         self.level_offset_db = level_offset_db
         self.flatness = load_flatness() if flatten else None
         self.image_check = image_check
-        self._floors: dict[float, np.ndarray] = {}  # last noise floor per window, for inline mirror checks
+        self._floors: dict[tuple[float, int], np.ndarray] = {}  # start and point count; discovery uses short sweeps
         self.settle = int(round(settle_us * 1e-6 * FS))
         self.n_samps = self.settle + POINTS_PER_DDC * readings * FFT_LEN
         self.buf = np.zeros(self.n_samps + self.stream.get_max_num_samps(), np.complex64)
@@ -158,6 +180,8 @@ class B210Sweeper:
         except Exception:
             rx_info = {}
         self.info = {
+            "profile": "b210",
+            "channel": channel,
             "mboard": self.usrp.get_mboard_name(),
             "mboard_id": rx_info.get("mboard_id", ""),
             "serial": rx_info.get("mboard_serial", ""),
@@ -165,12 +189,15 @@ class B210Sweeper:
             "rx_rate": self.usrp.get_rx_rate(channel),
             "rx_bandwidth": self.usrp.get_rx_bandwidth(channel),
             "gain_db": self.gain,
+            "level_offset_db": level_offset_db,
             "antenna": antenna,
             "fft_len": FFT_LEN,
             "readings_per_point": readings,
             "averaging": averaging,
             "flatness_correction": self.flatness is not None,
             "image_check": image_check,
+            "frequency_ranges_mhz": self.freq_ranges_mhz,
+            "gain_range_db": [self.gain_min_db, self.gain_max_db],
         }
 
     # ------------------------------------------------------------ radio
@@ -202,6 +229,8 @@ class B210Sweeper:
         return self.buf[:self.n_samps], bad or got < self.n_samps
 
     def set_gain(self, gain: float) -> None:
+        if not math.isfinite(gain) or not self.gain_min_db <= gain <= self.gain_max_db:
+            raise ValueError(f"gain must be {self.gain_min_db:g}-{self.gain_max_db:g} dB")
         self.usrp.set_rx_gain(gain, self.ch)
         self.gain = self.info["gain_db"] = self.usrp.get_rx_gain(self.ch)
         self._floors.clear()  # floors were measured at the old gain
@@ -209,6 +238,8 @@ class B210Sweeper:
     # ------------------------------------------------------------ measurement
 
     def sweep(self, start_mhz: float, n_points: int = N_BINS) -> SweepResult:
+        if not math.isfinite(start_mhz) or n_points <= 0:
+            raise ValueError("a sweep needs a finite start and a positive point count")
         plan = lo_plan(start_mhz, n_points)
         los = [lo for lo, _ in plan]
         if start_mhz < FREQ_MIN_MHZ or max(los) > FREQ_MAX_MHZ:
@@ -222,7 +253,8 @@ class B210Sweeper:
         over = total = bad = 0
         # With the previous sweep's floor, suspects are re-measured right after their own tune, while
         # the LO is still inside the AD9361 calibration window (no extra ~120 ms recalibrations).
-        prev_floor = self._floors.get(start_mhz) if self.image_check else None
+        floor_key = (start_mhz, n_points)
+        prev_floor = self._floors.get(floor_key) if self.image_check else None
         img = {"drops": [], "tunes": 0, "s": 0.0}
         for lo_mhz, first in plan:
             for side, ddc in ((0, -DDC_OFFSET), (1, DDC_OFFSET)):
@@ -232,6 +264,8 @@ class B210Sweeper:
                 self._tune(lo_mhz * 1e6, ddc)
                 iq, b = self._burst()
                 bad += b
+                if b:
+                    raise RuntimeError("incomplete or corrupt UHD burst; sweep discarded")
                 over += int(np.count_nonzero((np.abs(iq.real) > 0.9) | (np.abs(iq.imag) > 0.9)))
                 total += iq.size
                 ext[k0:k0 + POINTS_PER_DDC] = burst_to_points(iq, self.settle, self.readings, self.averaging)
@@ -240,7 +274,7 @@ class B210Sweeper:
         if self.image_check:
             if prev_floor is None:  # first sweep of this window: one pass at the end
                 self._fix_images(ext, instrument_floor(ext), {first: lo for lo, first in plan}, n_points, img)
-            self._floors[start_mhz] = instrument_floor(ext)
+            self._floors[floor_key] = instrument_floor(ext)
         extra = {"image_points": len(img["drops"]), "image_tunes": img["tunes"],
                  "image_drop_db": round(float(np.median(img["drops"])), 1) if img["drops"] else 0.0,
                  "image_max_drop_db": round(float(np.max(img["drops"])), 1) if img["drops"] else 0.0,

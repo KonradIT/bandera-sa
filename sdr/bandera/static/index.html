@@ -396,6 +396,8 @@ function renderHeader() {
 
 function syncControls() {
   const c = state.config;
+  const gains = state.device?.gain_range_db || [0, 76];
+  $("gain").min = gains[0]; $("gain").max = gains[1];
   $("w").value = String(c.w); $("gain").value = c.gain; $("auto").checked = c.auto_gain;
   $("wifi").checked = c.detect_wifi; $("whole").checked = c.whole_window; $("band").value = `${c.band[0]}-${c.band[1]}`;
   for (const btn of $("presets").children) btn.classList.toggle("on", btn.dataset.band === `${c.band[0]}-${c.band[1]}`);

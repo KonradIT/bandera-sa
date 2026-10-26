@@ -1,10 +1,10 @@
 # bandera-sdr / sdr
 
-This project runs the drone-signal detector from the Android app **Frontera 2.22** (`com.koritin.frontera`, NPO Apogei) on a PC. The input comes from a **LibreSDR B210 mini**, which here stands in for the Arinst SSA spectrum analyzer the app was built for.
+This project runs the drone-signal detector from the Android app **Frontera 2.22** (`com.koritin.frontera`, NPO Apogei) on a PC. It accepts **UHD-compatible SDRs**, defaulting to the measured LibreSDR B210 mini configuration, and can expose its sweeps through an Arinst serial adapter.
 
 ## What the model is
 
-The models are extracted from the APK and stored in the repo-root `models/`, unchanged. All of them are LiteRT/TFLite fp32 files trained in PyTorch, with the tag `RY_0_1_6_s_soup8b`.
+The models are extracted from the APK and stored in the repo-root `models/`, unchanged. All of them are LiteRT/TFLite fp32 files with the tag `RY_0_1_6_s_soup8b`; embedded tensor names identify a PyTorch / LiteRT Torch export path. The original training framework, dataset size and training recipe are not recorded. See the [model audit](../docs/model-training-audit-2026-10-26.md).
 
 | File | Role |
 | --- | --- |
@@ -29,7 +29,7 @@ Properties worth knowing:
 
 ## How the B210 imitates the Arinst
 
-The Arinst SSA measures one point at a time. Each point is a power reading through a fixed RBW of about 200 kHz. In the app the analyzer is asked for 3 MHz steps with `samples=20`, and the noise jitter of about 1.1 dB is consistent with averaging around 20 log-detector readings per point.
+The Arinst SSA measures one point at a time. The current emulation targets a roughly 200 kHz RBW, an estimate rather than a verified instrument setting. In `scn20`, **200 is the synthesizer timeout, not the RBW**, and 10700000 is the IF. The app asks for 3 MHz steps with `samples=20`; measured noise jitter of about 1.1 dB is consistent with averaging about 20 log-detector readings per point. This does not establish the instrument's averaging law or dwell time.
 
 Because every point is taken at a different instant, a bursty TDD video link appears as a **dotted** block. The model relies on exactly that texture, so a wideband FFT snapshot is not an adequate substitute.
 
@@ -70,6 +70,53 @@ python -m venv --system-site-packages .venv
 .venv\Scripts\python -m pip uninstall -y numpy   # keep the system numpy 1.26 that pyuhd was built against
 .venv\Scripts\python -m unittest discover -s tests -v
 ```
+
+## Other UHD devices
+
+`--profile auto` keeps the optimized B210 implementation when UHD identifies a B200/B210 and no custom rate or bandwidth was requested. The default `--args type=b200` still selects the LibreSDR. Device arguments are passed to UHD; use `--args ""` for UHD's default discovery or select a different device explicitly. `--device` is an alias for `--args`.
+
+```powershell
+# Keep the existing LibreSDR configuration and paired-DDC sweep plan.
+.venv\Scripts\python -m bandera run --band 5650-5950 --w 8 --auto-gain
+
+# Example for another UHD device; select a band and antenna supported by its frontend.
+.venv\Scripts\python -m bandera run --args "addr=192.168.10.2" --profile generic --rate 10e6 --band 2300-2500 --gain 20 --antenna RX2 --w 8
+
+# Exercise the portable implementation on the connected B210.
+.venv\Scripts\python -m bandera sweep-test --profile generic --rate 10e6 --start 4200 --sweeps 2
+```
+
+The generic backend queries the selected channel's frequency ranges, gain range, antennas, actual sample rate and bandwidth. It uses separate time slots for each point and computes power at the exact requested frequency, including when UHD coerces a sample rate. The Hann window scales with the actual rate to retain approximately 180 kHz 3 dB bandwidth. Its tuning groups stay within the inner 80% of the sampled/analog passband and avoid measuring at DC. It polls `lo_locked` where available and discards settling samples after each tune. This follows UHD's [tuning and settling guidance](https://files.ettus.com/manual/page_general.html).
+
+Useful options:
+
+| Option | Meaning |
+| --- | --- |
+| `--channel 1` | Select RX channel 1 for both tuning and the sample stream. |
+| `--subdev "A:0"` | Apply a UHD RX subdevice specification before selecting the channel. |
+| `--antenna NAME` | Select an advertised antenna. Default: RX2 if available, otherwise the device's default. |
+| `--gain DB` | Explicit gain, checked against the device. Default: 60 dB limited to the advertised range. |
+| `--rate 10e6` | Generic sample rate, in samples/s; the actual UHD rate determines extraction geometry. |
+| `--bandwidth 10e6` | Request analog bandwidth in Hz. If a fixed-filter frontend cannot report bandwidth, this is the user's known bandwidth limit; device metadata marks it as unreported. |
+| `--master-clock-rate HZ` | Explicit UHD master clock. A non-56 MHz clock selects the generic profile. |
+| `--settle-us 1000` | Discard this many microseconds of samples after each tune; generic default 1000, B210 default 100. |
+| `--level-offset DB` | Add a measured calibration offset. Default readings are relative receiver levels, not calibrated dBm. |
+
+Requested bands outside the frontend's ranges are rejected. A frontend with less than 1800 MHz coverage still produces the fixed 600-point model input: points outside its physical range are explicitly floored at -120 dB, with measured/floored counts in sweep metadata. Such partial coverage changes the model's input statistics, so classification fidelity must be measured on that device. The B210 profile retains its 70–6000 MHz bounds and requires its fixed clock/rate/bandwidth.
+
+The generic profile does not apply B210-specific slot calibration, AD9361 tune ordering or IQ-image remeasurement. `calibrate` is therefore restricted to the B210 profile. USB/network throughput, tuning latency and frontend response differ by device; this is API portability, not a claim that every radio has been tested or meets the Android app's two-second deadline. On the connected LibreSDR, two generic 10 MS/s 600-point sweeps took 6.54 and 6.53 seconds. The B210 profile remains the appropriate default for this unit.
+
+Incomplete/corrupt UHD bursts are rejected before power extraction. The live scanner clears its consecutive-sweep buffer on overload above 0.1%, invalid samples or reported bad bursts, and waits for W clean sweeps before inference resumes. Recordings retain rejected rows and their quality metadata for inspection. Web replay, CLI replay and plots preserve these quality checks; no model window containing a rejected row is classified. Older sidecars lacking quality fields are treated as clean, apart from nonfinite samples.
+
+## Arinst serial adapter
+
+```powershell
+.venv\Scripts\python -m bandera serial --port COM12 --gain 60
+```
+
+The server supports `test`, Frontera's 100–200 MHz discovery probe, and `scn20` requests on the model's 3 MHz grid. It emits the leading CRLF, echoed command/start/index, big-endian level words, `FF FF`, elapsed milliseconds and `complete` trailer. Binary samples are length-delimited; newline bytes inside samples are data. Legacy control fields are parsed but do not change the configured SDR dwell, gain or RBW. This is a receive sweep adapter, not a complete emulation of every Arinst command or analog control.
+
+`--port` is a serial endpoint, for example one side of a virtual COM pair; an ordinary B210 USB connection does not become a USB CDC analyzer. Connecting a phone requires a suitable serial bridge/USB device and the Bandera app's supported USB identification. No physical PC-to-phone serial bridge was connected during validation. `--max-requests N` bounds a test session. A stock discovery request completed in 399 ms on the LibreSDR after opening the device; generic full sweeps can exceed the app's timeout.
 
 ## Live web page
 
@@ -162,7 +209,7 @@ Not ported:
 
 ## Known gaps
 
-- **Arinst behaviour is inferred, not confirmed.** The exact detector is unknown: log versus linear averaging, the meaning of `samples=20`, and the per-point dwell. So is how long one Arinst sweep takes, which matters for sweep-to-sweep statistics. The B210 sweep takes about 1.3 s per window.
-- **The B210 has a lower noise figure than the Arinst.** Signals therefore sit higher above the floor than in the training data. There is no option yet to degrade the SNR on purpose.
+- **Arinst measurement behaviour is only partly established.** The protocol defines `samples` as an ADC sample count, but the detector's exact log/linear averaging, filter shape, per-point dwell and reference sweep cadence remain unmeasured. A same-signal comparison with an actual Arinst is still needed. The B210 profile typically takes about 1.3–1.6 s per window on this host, with occasional longer scheduling/retuning delays.
+- **Cross-device SNR is not calibrated.** Gain, noise figure, antenna and measurement bandwidth can change the spectrum relative to the training data. There is no controlled side-by-side measurement establishing a universal B210-versus-Arinst noise-figure advantage, and no deliberate SNR-degradation option.
 - **Mirror suppression does not cover the band edges.** Points whose re-measure LO would fall outside 70–6000 MHz are left as measured: A-side points of the first tune of a window starting near 70 MHz, and B-side points of the last tune near 6 GHz. Spurs other than the IQ image, such as LO harmonics or ADC aliases, are not handled.
-- **The coverage limit is 6 GHz.** The app reaches 12 GHz with its Horizont-12 downconverter; this setup cannot.
+- **The B210 profile stops at 6 GHz.** The generic profile uses the connected frontend's advertised frequency ranges. The app's Horizont-12 downconverter arrangement is not implemented here.

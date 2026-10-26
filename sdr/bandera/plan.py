@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 
 from .b210 import FREQ_MAX_MHZ, FREQ_MIN_MHZ
 from .model import N_BINS, SPAN_MHZ, STEP_MHZ
@@ -30,8 +31,15 @@ class Window:
 
 def plan_windows(lo_mhz: float, hi_mhz: float,
                  fmin: float = FREQ_MIN_MHZ, fmax: float = FREQ_MAX_MHZ) -> list[Window]:
-    if hi_mhz <= lo_mhz:
+    if not all(math.isfinite(v) for v in (lo_mhz, hi_mhz, fmin, fmax)) or hi_mhz <= lo_mhz:
         raise ValueError("empty band")
+    if not fmin <= lo_mhz < hi_mhz <= fmax:
+        raise ValueError(f"band {lo_mhz:g}-{hi_mhz:g} MHz is outside RX range {fmin:g}-{fmax:g} MHz")
+    if fmax - fmin < SPAN_MHZ:
+        # Frequency-limited frontends still feed the unchanged 600 x 3 MHz model.
+        # The generic backend marks unavailable frequencies as instrument floor.
+        start = max(0.0, (lo_mhz + hi_mhz - SPAN_MHZ) / 2)
+        return [Window(0, start, -1e9, 1e9)]
     max_start = fmax - SPAN_MHZ  # keeps the last LO tune (start + 1798.5) inside the AD9361 range
     clamp = lambda s: min(max(s, fmin), max_start)
     if hi_mhz - lo_mhz <= SPAN_MHZ:

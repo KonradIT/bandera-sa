@@ -1,4 +1,4 @@
-"""bandera: run the Frontera 2.22 drone-signal model on LibreSDR/B210 sweeps.
+"""bandera: run the Frontera 2.22 drone-signal model on UHD SDR sweeps.
 
     python -m bandera selftest
     python -m bandera web --band 2300-2550          # live page at http://127.0.0.1:8765/
@@ -30,11 +30,15 @@ def _fmt_boxes(boxes, targets_only=False, targets=()):
 
 
 def _sweeper(a, flatten=None):
-    from .b210 import B210Sweeper
-    return B210Sweeper(args=a.args, gain=a.gain, antenna=a.antenna, channel=a.channel,
-                       readings=a.readings, averaging=a.averaging,
-                       flatten=(not a.no_flatten) if flatten is None else flatten,
-                       image_check=not a.no_image_check)
+    from .uhd_sweeper import create_sweeper
+    sweeper = create_sweeper(args=a.args, profile=a.profile, gain=a.gain, antenna=a.antenna, channel=a.channel,
+                             readings=a.readings, averaging=a.averaging,
+                             flatten=(not a.no_flatten) if flatten is None else flatten,
+                             image_check=not a.no_image_check, rate=a.rate, bandwidth=a.bandwidth,
+                             master_clock_rate=a.master_clock_rate, settle_us=a.settle_us,
+                             subdev=a.subdev, level_offset_db=a.level_offset)
+    a.gain = sweeper.gain
+    return sweeper
 
 
 def _parse_band(text: str) -> tuple[float, float]:
@@ -63,7 +67,7 @@ def cmd_sweep_test(a) -> int:
         rows.append(r.db)
         img = (f", image fixes {r.extra['image_points']} pts in {r.extra['image_tunes']} tunes "
                f"(median drop {r.extra['image_drop_db']} dB, max {r.extra['image_max_drop_db']} dB, "
-               f"{r.extra['image_s'] * 1e3:.0f} ms)") if r.extra else ""
+               f"{r.extra['image_s'] * 1e3:.0f} ms)") if "image_points" in r.extra else ""
         print(f"sweep {i + 1}: {r.duration_s * 1e3:.0f} ms, overload {r.overload_frac:.1e}, bad bursts {r.bad_bursts}{img}")
     x = np.asarray(rows)
     med = np.median(x, axis=0)
@@ -89,6 +93,8 @@ def cmd_calibrate(a) -> int:
     from .recording import utc_stamp
 
     s = _sweeper(a, flatten=False)
+    if s.info.get("profile") != "b210":
+        raise ValueError("calibrate measures the B210's 16-slot ripple; use the b210 profile")
     devs, slots, per_window = [], [], {}
     for win in plan_windows(*_parse_band(a.band)):
         x = np.asarray([s.sweep(win.start_mhz).db for _ in range(a.sweeps)])
@@ -117,8 +123,9 @@ def cmd_run(a) -> int:
     from .recording import utc_stamp
     from .scanner import OVERLOAD_WARN, LiveSource, ScanConfig, Scanner
 
+    sweeper = _sweeper(a)
     cfg = ScanConfig(_parse_band(a.band), a.w, a.gain, a.auto_gain, a.detect_wifi, a.whole_window)
-    scanner = Scanner(LiveSource(_sweeper(a)), cfg)
+    scanner = Scanner(LiveSource(sweeper), cfg)
     if a.record:
         scanner.start_recording(Path(a.record), a.tag)
     targets = set(scanner.tracker.classes)
@@ -137,6 +144,8 @@ def cmd_run(a) -> int:
             steps += 1
             warn = f" OVERLOAD {ev['overload']:.1e}" if ev["overload"] > OVERLOAD_WARN else ""
             head = f"{datetime.now():%H:%M:%S} [{labels[ev['window']]}] #{ev['visit']} {ev['sweep_s']:.2f}s"
+            log.write(json.dumps({k: ev[k] for k in ev if k != "rel"}) + "\n")
+            log.flush()
             if ev["fill"] < ev["w"]:
                 print(f"{head} filling {ev['fill']}/{ev['w']}{warn}")
                 continue
@@ -149,8 +158,6 @@ def cmd_run(a) -> int:
                     print(f"  >>> CONFIRMED {e['cls']} {e['lo']:.0f}-{e['hi']:.0f} MHz score {e['score']:.2f} ({how})")
                 elif e["kind"] == "lost":
                     print(f"  --- lost {e['cls']} ~{e['center']:.0f} MHz (best {e['best']:.2f})")
-            log.write(json.dumps({k: ev[k] for k in ev if k != "rel"}) + "\n")
-            log.flush()
     except KeyboardInterrupt:
         print("\nstopped")
     finally:
@@ -167,6 +174,8 @@ def cmd_web(a) -> int:
     if a.replay:
         source = ReplaySource(Path(a.replay), speed=a.speed)
         band, mode, auto = (source.start_mhz, source.start_mhz + 1797.0), "replay", False
+        if a.gain is None:
+            a.gain = source.gain
     else:
         source = LiveSource(_sweeper(a))
         band, mode, auto = _parse_band(a.band), "live", a.auto_gain
@@ -177,28 +186,45 @@ def cmd_web(a) -> int:
     return 0
 
 
-def _replay(sweeps, start, w, every, detect_wifi):
+def cmd_serial(a) -> int:
+    from .arinst import serve_serial
+    return serve_serial(_sweeper(a), a.port, baudrate=a.baud, timeout=a.timeout,
+                        max_requests=a.max_requests)
+
+
+def _replay(sweeps, start, w, every, detect_wifi, meta=None):
+    from .recording import valid_sweep_mask
+    from .scanner import OVERLOAD_WARN
     from .tracker import Tracker, merge_boxes
+    if every <= 0:
+        raise ValueError("replay step must be positive")
     model = RegionModel()
     tracker = Tracker(w, detect_wifi)
+    valid = valid_sweep_mask(sweeps, meta or {}, OVERLOAD_WARN)
     steps = []
     for i in range(w, len(sweeps) + 1, every):
-        _, boxes = model.detect(sweeps[i - w:i], start, w)
-        boxes = merge_boxes(boxes)
+        boxes = []
+        if valid[i - w:i].all():
+            _, boxes = model.detect(sweeps[i - w:i], start, w)
+            boxes = merge_boxes(boxes)
         events = tracker.update(0, i, boxes)
         steps.append((i, boxes, events))
     return steps, tracker
 
 
 def cmd_replay(a) -> int:
-    from .recording import load_recording
+    from .recording import load_recording, valid_sweep_mask
+    from .scanner import OVERLOAD_WARN
     from .tracker import TARGET_CLASSES
     sweeps, meta = load_recording(a.file)
     start = a.start if a.start is not None else meta.get("start_mhz")
     if start is None:
         print("no start frequency: pass --start or keep the .json sidecar next to the .npy")
         return 2
-    steps, tracker = _replay(sweeps, start, a.w, a.every, a.detect_wifi)
+    invalid = int((~valid_sweep_mask(sweeps, meta, OVERLOAD_WARN)).sum())
+    if invalid:
+        print(f"quality: {invalid} invalid/overloaded sweeps; windows containing them are excluded from inference")
+    steps, tracker = _replay(sweeps, start, a.w, a.every, a.detect_wifi, meta)
     targets = set(tracker.classes)
     for i, boxes, events in steps:
         line = _fmt_boxes(boxes, a.targets_only, targets)
@@ -232,7 +258,7 @@ def cmd_plot(a) -> int:
     sweeps, meta = load_recording(a.file)
     start = a.start if a.start is not None else meta.get("start_mhz", 0.0)
     freqs = start + np.arange(sweeps.shape[1]) * STEP_MHZ
-    steps, _ = _replay(sweeps, start, a.w, 1, a.detect_wifi) if len(sweeps) >= a.w else ([], None)
+    steps, _ = _replay(sweeps, start, a.w, 1, a.detect_wifi, meta) if len(sweeps) >= a.w else ([], None)
     fig, (ax0, ax1) = plt.subplots(2, 1, figsize=(16, 9), sharex=True, gridspec_kw={"height_ratios": [3, 1]})
     vmin, vmax = np.percentile(sweeps, [5, 99.5])
     ax0.imshow(sweeps, aspect="auto", origin="lower", cmap="viridis", vmin=vmin, vmax=vmax,
@@ -267,10 +293,18 @@ def main(argv=None) -> int:
     sub = p.add_subparsers(dest="cmd", required=True)
 
     def radio(sp):
-        sp.add_argument("--args", default="type=b200", help="UHD device args")
-        sp.add_argument("--gain", type=float, default=60.0, help="RX gain dB (60 = no overload in a city)")
-        sp.add_argument("--antenna", default="RX2")
+        sp.add_argument("--args", "--device", default="type=b200", help="UHD device args (default: type=b200)")
+        sp.add_argument("--profile", choices=["auto", "b210", "generic"], default="auto",
+                        help="auto uses the optimized B210 profile on B200/B210 hardware")
+        sp.add_argument("--gain", type=float, help="RX gain dB (default: 60, limited to the device's range)")
+        sp.add_argument("--antenna", help="RX antenna (default: RX2 if available, otherwise device default)")
         sp.add_argument("--channel", type=int, default=0)
+        sp.add_argument("--subdev", help="UHD RX subdevice specification, e.g. A:0")
+        sp.add_argument("--rate", type=float, help="generic profile sample rate in samples/s, e.g. 10e6")
+        sp.add_argument("--bandwidth", type=float, help="generic profile analog RX bandwidth in Hz")
+        sp.add_argument("--master-clock-rate", type=float, help="UHD master clock in Hz")
+        sp.add_argument("--settle-us", type=float, help="samples discarded after tuning (B210: 100 us, generic: 1000 us)")
+        sp.add_argument("--level-offset", type=float, default=0.0, help="measured level offset in dB; no absolute dBm calibration by default")
         sp.add_argument("--readings", type=int, default=24, help="log readings averaged per point (24 ~ Arinst jitter)")
         sp.add_argument("--averaging", choices=["log", "lin"], default="log")
         sp.add_argument("--no-flatten", action="store_true", help="ignore flatness.json")
@@ -286,6 +320,14 @@ def main(argv=None) -> int:
 
     sp = sub.add_parser("selftest", help="golden self-test of the model port (no radio)")
     sp.set_defaults(fn=cmd_selftest)
+
+    sp = sub.add_parser("serial", help="serve Arinst test/scn20 commands on a serial port")
+    radio(sp)
+    sp.add_argument("--port", required=True, help="serial port, e.g. COM12 (one end of a virtual COM pair)")
+    sp.add_argument("--baud", type=int, default=115200)
+    sp.add_argument("--timeout", type=float, default=0.1)
+    sp.add_argument("--max-requests", type=int, default=0, help="stop after N commands (0 = forever)")
+    sp.set_defaults(fn=cmd_serial)
 
     sp = sub.add_parser("sweep-test", help="a few sweeps: timing, overload, noise statistics")
     radio(sp)
@@ -342,7 +384,10 @@ def main(argv=None) -> int:
     sp.set_defaults(fn=cmd_plot)
 
     a = p.parse_args(argv)
-    return a.fn(a)
+    try:
+        return a.fn(a)
+    except (ValueError, RuntimeError) as error:
+        p.exit(2, f"bandera: {error}\n")
 
 
 if __name__ == "__main__":
