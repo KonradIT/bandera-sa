@@ -1,0 +1,14 @@
+# PlatformIO build output
+firmware/.pio/
+firmware/.pio.nosync/
+
+# ESP-IDF managed components (auto-fetched from src/idf_component.yml on build)
+firmware/managed_components/
+firmware/dependencies.lock
+
+# Reference checkouts (restore with the clone commands in the README)
+reference/
+
+# Build logs and local captures
+build*.log
+*.npy
