@@ -1,0 +1,114 @@
+name: Patch Frontera -> Bandera
+
+# On-demand only. Downloads the stock Frontera APK from an env-var URL (a GitHub release asset),
+# patches it into Bandera, stamps the current main SHA as the version, and publishes the result
+# as a GitHub release.
+on:
+  workflow_dispatch:
+    inputs:
+      apk_url:
+        description: "Frontera APK URL (overrides the FRONTERA_APK_URL variable)"
+        required: false
+        default: ""
+      prerelease:
+        description: "Mark the release as a pre-release"
+        type: boolean
+        default: true
+
+permissions:
+  contents: write   # create releases
+
+env:
+  # The stock Frontera APK lives in a GitHub release; its URL is a repository variable.
+  # Set it under Settings -> Secrets and variables -> Actions -> Variables: FRONTERA_APK_URL
+  FRONTERA_APK_URL: ${{ vars.FRONTERA_APK_URL }}
+  APKTOOL_VERSION: "3.0.3"
+  UBER_SIGNER_VERSION: "1.3.0"
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve inputs
+        id: cfg
+        run: |
+          URL="${{ github.event.inputs.apk_url }}"
+          [ -z "$URL" ] && URL="${FRONTERA_APK_URL}"
+          if [ -z "$URL" ]; then
+            echo "::error::No APK URL. Set the FRONTERA_APK_URL repository variable or pass apk_url."
+            exit 1
+          fi
+          echo "apk_url=$URL" >> "$GITHUB_OUTPUT"
+          echo "short_sha=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Download build tools
+        run: |
+          mkdir -p tools
+          curl -fsSL -o tools/apktool.jar \
+            "https://github.com/iBotPeaches/Apktool/releases/download/v${APKTOOL_VERSION}/apktool_${APKTOOL_VERSION}.jar"
+          curl -fsSL -o tools/uber-apk-signer.jar \
+            "https://github.com/patrickfav/uber-apk-signer/releases/download/v${UBER_SIGNER_VERSION}/uber-apk-signer-${UBER_SIGNER_VERSION}.jar"
+
+      - name: Download Frontera APK
+        env:
+          GH_TOKEN: ${{ github.token }}
+          URL: ${{ steps.cfg.outputs.apk_url }}
+        run: |
+          # Send the token only to github.com (so private-repo release assets work; no leak elsewhere).
+          if echo "$URL" | grep -qi '://[^/]*github\.com/'; then
+            curl -fsSL -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/octet-stream" -o frontera.apk "$URL"
+          else
+            curl -fsSL -o frontera.apk "$URL"
+          fi
+          file frontera.apk; echo "Downloaded $(du -h frontera.apk | cut -f1)"
+          head -c 2 frontera.apk | grep -q 'PK' || { echo "::error::Downloaded file is not an APK (check the URL / auth)"; exit 1; }
+
+      - name: Patch
+        run: |
+          python patcher/patch.py \
+            --apk frontera.apk \
+            --out "bandera-${{ steps.cfg.outputs.short_sha }}.apk" \
+            --version "${{ steps.cfg.outputs.short_sha }}" \
+            --version-code "${{ github.run_number }}" \
+            --tools-dir tools
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bandera-${{ steps.cfg.outputs.short_sha }}
+          path: bandera-${{ steps.cfg.outputs.short_sha }}.apk
+          if-no-files-found: error
+
+      - name: Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="bandera-${{ steps.cfg.outputs.short_sha }}"
+          PRE=""
+          [ "${{ github.event.inputs.prerelease }}" = "true" ] && PRE="--prerelease"
+          NOTES="Bandera build from Frontera.
+          - Source commit: ${{ github.sha }}
+          - App versionName: ${{ steps.cfg.outputs.short_sha }} (versionCode ${{ github.run_number }})
+          - Patched from: ${{ steps.cfg.outputs.apk_url }}
+          Debug-signed; sideload only."
+          # Idempotent: drop any existing release/tag for this commit, then recreate.
+          gh release delete "$TAG" --yes --cleanup-tag 2>/dev/null || true
+          gh release create "$TAG" \
+            "bandera-${{ steps.cfg.outputs.short_sha }}.apk" \
+            --title "Bandera ${{ steps.cfg.outputs.short_sha }}" \
+            --notes "$NOTES" $PRE \
+            --target "${{ github.sha }}"
