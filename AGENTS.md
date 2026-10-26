@@ -20,10 +20,12 @@ Platform: Windows 11. Two shells are used and they are **not** interchangeable (
 | `esp32-sdr-arinst/` | Firmware making a **Seeed XIAO ESP32-C5** speak the Arinst `scn20` protocol over USB serial, using the chip's Wi-Fi-radio SDR mode. The $7 backend. | `pio run -e esp32c5` (PowerShell) |
 | `patcher/` | Reproducible APK patcher (stock Frontera → **Bandera**, + accept the C5 as an analyzer). `patch.py` + `overlay/`. | `python patcher/patch.py ...` |
 | `.github/workflows/patch-apk.yml` | On-demand (`workflow_dispatch`) CI that downloads the stock APK, runs the patcher, publishes a release. | GitHub Actions |
+| `.github/workflows/build-firmware.yml` | On-demand CI that builds C5/S3, validates merged factory images, publishes `firmware-<sha>`. | GitHub Actions |
 | `modded_app/` | **Local-only** scratch: fresh apktool decode, tool downloads, build outputs. Git-ignored at root. Not needed to build anything; `patcher/` is the source of truth. |
 | `tools/`, `build/` | Downloaded jars / transient build dirs. Git-ignored. |
 
-Remote: `origin` = `github.com/KonradIT/bandera-sa`. The CI release tag is `bandera-<short-sha>`.
+Remote: `origin` = `github.com/KonradIT/bandera-sa`. APK release tags use
+`bandera-<short-sha>`; firmware uses `firmware-<short-sha>`.
 
 ---
 
@@ -109,6 +111,13 @@ Forked from CapnBry/widscan58 (on ESPARGOS/esp-sdr). New code is in `firmware/sr
 & "$HOME\.platformio\penv\Scripts\pio.exe" run -e esp32c5 -t upload --upload-port COM5 -d <...>\firmware
 ```
 - Toolchain: **pioarduino 55.03.312-1** (ESP-IDF 5.5.5, PIO Core 6.2.x). See `[platformio-setup]`.
+- Firmware CI installs `pioarduino==6.2.0` on Ubuntu and builds `esp32c5` and `esp32s3`.
+  The S3 Arinst path is experimental and restricted to 2400–2500 MHz; only C5 has
+  live Arinst RF/phone validation. Preserve that distinction in release notes.
+- pioarduino automatically merges `firmware.factory.bin`, but merger failures can
+  leave the build green. `firmware/scripts/package_firmware.py` validates all three
+  segments against `flasher_args.json` before publication. Merged images start at
+  **0x0** on both chips (the C5 bootloader is internally at 0x2000; S3 at 0x0).
 - The C5 enumerates on **COM5**, VID/PID **303a:1001** (Espressif USB-Serial/JTAG). `before_reset = usb-reset`
   resets into download mode in hardware — no BOOT button needed.
 - A **full** rebuild (anything that touches `sdkconfig*`) can trip the known esptool penv breakage

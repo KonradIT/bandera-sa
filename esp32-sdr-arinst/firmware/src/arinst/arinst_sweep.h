@@ -29,6 +29,9 @@ typedef struct { uint64_t lo_hz, hi_hz; } arinst_band_t;
 /* The C5's usable receive bands (radio_c5.c: 5 GHz is the FPV range, plus 2.4 GHz). */
 extern const arinst_band_t ARINST_C5_BANDS[];
 extern const int ARINST_C5_NBANDS;
+/* The S3 has only a 2.4 GHz radio; never plan C5's 5 GHz hops on this target. */
+extern const arinst_band_t ARINST_S3_BANDS[];
+extern const int ARINST_S3_NBANDS;
 
 typedef struct {
     uint64_t start_hz, stop_hz, step_hz;

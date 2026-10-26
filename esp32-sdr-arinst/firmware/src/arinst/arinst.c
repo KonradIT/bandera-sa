@@ -17,6 +17,14 @@
 #include "scanner.h"
 #include "link.h"
 
+#if defined(RX_TARGET_S3)
+#define ARINST_BANDS ARINST_S3_BANDS
+#define ARINST_NBANDS ARINST_S3_NBANDS
+#else
+#define ARINST_BANDS ARINST_C5_BANDS
+#define ARINST_NBANDS ARINST_C5_NBANDS
+#endif
+
 #define ARINST_RATE_CODE 0       /* 80 MS/s keeps adjacent-hop carriers out of Nyquist aliases. */
 #define ARINST_USABLE_FRAC 0.40  /* Retain the flat inner +/-16 MHz of the analog filter. */
 #define ARINST_NFFT 1024         /* PSD_MAX_FFT on the C5 */
@@ -67,7 +75,7 @@ void arinst_scan(const arinst_req_t *req) {
     arinst_hop_t *hops = s_hops;
     int covered = 0;
     int nhops = arinst_plan(req, (double)radio_caps()->rates_hz[ARINST_RATE_CODE], ARINST_USABLE_FRAC,
-                            ARINST_DC_DEAD_HZ, ARINST_C5_BANDS, ARINST_C5_NBANDS, hops,
+                            ARINST_DC_DEAD_HZ, ARINST_BANDS, ARINST_NBANDS, hops,
                             req->points < ARINST_MAX_HOPS ? req->points : ARINST_MAX_HOPS, &covered);
 
     int64_t t0 = esp_timer_get_time();

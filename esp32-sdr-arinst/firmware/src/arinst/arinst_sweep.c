@@ -17,6 +17,11 @@ const arinst_band_t ARINST_C5_BANDS[] = {
 };
 const int ARINST_C5_NBANDS = (int)(sizeof(ARINST_C5_BANDS) / sizeof(ARINST_C5_BANDS[0]));
 
+const arinst_band_t ARINST_S3_BANDS[] = {
+    {2400000000ULL, 2500000000ULL},
+};
+const int ARINST_S3_NBANDS = (int)(sizeof(ARINST_S3_BANDS) / sizeof(ARINST_S3_BANDS[0]));
+
 char arinst_command(const char *line) {
     if (!line) return 0;
     while (isspace((unsigned char)*line)) line++;

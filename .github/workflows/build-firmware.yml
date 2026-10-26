@@ -1,0 +1,136 @@
+name: Build ESP32 firmware
+
+on:
+  workflow_dispatch:
+    inputs:
+      prerelease:
+        description: "Mark the release as a pre-release"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: firmware-${{ github.sha }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [esp32c5, esp32s3]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # PROJECT_VER uses git describe.
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install PlatformIO Core
+        # The platform/ESP-IDF version is pinned in firmware/platformio.ini.
+        run: python -m pip install pioarduino==6.2.0
+
+      - name: Host regression tests
+        if: matrix.target == 'esp32c5'
+        run: |
+          gcc -std=c11 -Wall -Wextra -Werror -O2 \
+            -Iesp32-sdr-arinst/firmware/src/arinst \
+            esp32-sdr-arinst/firmware/test/test_arinst_sweep.c \
+            esp32-sdr-arinst/firmware/src/arinst/arinst_sweep.c \
+            -lm -o "$RUNNER_TEMP/test-arinst"
+          "$RUNNER_TEMP/test-arinst"
+          python -m unittest discover -s esp32-sdr-arinst/firmware/scripts -p 'test_*.py'
+
+      - name: Build firmware
+        env:
+          TARGET: ${{ matrix.target }}
+        run: pio run --project-dir esp32-sdr-arinst/firmware --environment "$TARGET"
+
+      - name: Validate and package factory image
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          python esp32-sdr-arinst/firmware/scripts/package_firmware.py \
+            --build-dir "esp32-sdr-arinst/firmware/.pio/build/$TARGET" \
+            --target "$TARGET" --version "${GITHUB_SHA::7}" --out-dir build/firmware
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bandera-firmware-${{ matrix.target }}
+          path: build/firmware/*
+          if-no-files-found: error
+
+  release:
+    name: Publish firmware release
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download both images
+        uses: actions/download-artifact@v4
+        with:
+          pattern: bandera-firmware-*
+          merge-multiple: true
+          path: build/firmware
+
+      - name: Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PRERELEASE: ${{ inputs.prerelease }}
+        run: |
+          SHORT_SHA="${GITHUB_SHA::7}"
+          TAG="firmware-$SHORT_SHA"
+          # Require both validated images and verify the downloaded checksums.
+          for TARGET in esp32c5 esp32s3; do
+            (cd build/firmware && sha256sum --check "bandera-$TARGET-$SHORT_SHA.factory.bin.sha256")
+          done
+          cat > build/firmware-release-notes.md <<EOF
+          Bandera receiver firmware from commit $GITHUB_SHA.
+
+          Download the .factory.bin matching your chip; it includes the bootloader,
+          partition table and application. Flash this single file at **0x0**.
+          Both builds use the project's 4 MB flash layout. Flashing resets stored settings.
+
+          | Image | Receiver |
+          | --- | --- |
+          | esp32c5 | XIAO ESP32-C5; 2.4 and 5 GHz |
+          | esp32s3 | ESP32-S3 with native USB Serial/JTAG; experimental, 2.4 GHz only |
+
+          Use desktop Chrome/Edge at https://espflash.app/ for either chip.
+          https://esptool.spacehuhn.com/ supports S3; its current flasher does not support C5.
+          Select offset 0x0 if the utility asks for an address. Use the native USB port,
+          close serial monitors, flash, then reset the board. Hold BOOT while resetting
+          if the utility cannot enter the downloader automatically.
+
+          S3 has build/host-test coverage; its Arinst RF performance has not been validated.
+          JSON files record flash settings/segments; .sha256 files verify each image.
+          Full instructions: https://github.com/$GITHUB_REPOSITORY/blob/$GITHUB_SHA/esp32-sdr-arinst/README.md#download-and-flash-a-ci-build
+          EOF
+          # Separate tag namespace from APK releases; reruns replace assets in place.
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" build/firmware/* --clobber
+            gh release edit "$TAG" --title "Bandera firmware $SHORT_SHA" \
+              --notes-file build/firmware-release-notes.md --prerelease="$PRERELEASE"
+          else
+            FLAGS=()
+            if [ "$PRERELEASE" = true ]; then FLAGS+=(--prerelease); fi
+            gh release create "$TAG" build/firmware/* \
+              --title "Bandera firmware $SHORT_SHA" \
+              --notes-file build/firmware-release-notes.md \
+              --target "$GITHUB_SHA" "${FLAGS[@]}"
+          fi

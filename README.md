@@ -77,6 +77,11 @@ for exact sizes, tensor shapes, the app's labeled recording format, and the limi
 
 Each folder has its own README.
 
+Prebuilt ESP32 firmware can be produced with **Actions → Build ESP32 firmware →
+Run workflow**. It publishes merged C5 and experimental S3 `.factory.bin` images
+for flashing at `0x0`; see the [web flashing instructions](esp32-sdr-arinst/README.md#download-and-flash-a-ci-build).
+S3 supports 2.4 GHz only.
+
 ## Bandera App:
 
 The patcher modifies the app to accept the **ESP32-C5** as its analyzer. A simple modification allows the app to see the ESP32 as an Arinst/Frontera SA.

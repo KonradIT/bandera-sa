@@ -203,6 +203,25 @@ int main(void) {
     int low_hops = arinst_plan(&low, 80e6, .4, DEAD, ARINST_C5_BANDS, ARINST_C5_NBANDS,
                               hops, ARINST_MAX_HOPS, &covered);
     check(low_hops > 0 && covered == 34, "2.4 GHz window covers all 34 supported points");
+
+    printf("S3 band limits\n");
+    int s3_hops = arinst_plan(&low, 80e6, .4, DEAD, ARINST_S3_BANDS, ARINST_S3_NBANDS,
+                             hops, ARINST_MAX_HOPS, &covered);
+    check(s3_hops == low_hops && covered == 34, "S3 covers all 34 supported 2.4 GHz points");
+    int s3_plan_ok = 1;
+    for (int h = 0; h < s3_hops; h++)
+        s3_plan_ok &= hops[h].lo_hz >= 2400000000ULL && hops[h].lo_hz <= 2500000000ULL;
+    check(s3_plan_ok, "S3 LOs stay inside the 2.4 GHz band");
+    check(arinst_plan(&req, 80e6, .4, DEAD, ARINST_S3_BANDS, ARINST_S3_NBANDS,
+                      hops, ARINST_MAX_HOPS, &covered) == 0 && covered == 0,
+          "S3 never tunes the 4200-5997 MHz request");
+    for (int i = 0; i < req.points; i++) dbm[i] = ARINST_FLOOR_DBM;
+    len = arinst_build_packet(&req, dbm, 0, pkt, sizeof(pkt));
+    n = parse_packet(pkt, len, &start_mhz, &idx, got, ARINST_MAX_POINTS);
+    int s3_floor_ok = n == 600;
+    for (int i = 0; i < n; i++) s3_floor_ok &= got[i] == ARINST_FLOOR_DBM;
+    check(s3_floor_ok, "unsupported S3 5 GHz request still returns 600 floor points");
+
     arinst_req_t discovery = arinst_parse("scn20 100000000 200000000 10000000 200 1 10700000 10000 0");
     check(discovery.ok && discovery.points == 11 &&
           arinst_plan(&discovery, 80e6, .4, DEAD, ARINST_C5_BANDS, ARINST_C5_NBANDS,

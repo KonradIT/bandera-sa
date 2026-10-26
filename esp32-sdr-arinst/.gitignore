@@ -6,6 +6,9 @@ firmware/.pio.nosync/
 firmware/managed_components/
 firmware/dependencies.lock*
 
+# S3 sdkconfig is generated from sdkconfig.defaults; the tuned C5 config is tracked.
+firmware/sdkconfig.esp32s3*
+
 # Reference checkouts (restore with the clone commands in the README)
 reference/
 

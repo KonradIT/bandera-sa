@@ -1,8 +1,12 @@
-# ESP32-C5 Arinst-compatible receiver
+# ESP32-C5 / ESP32-S3 Arinst-compatible receiver
 
 Firmware for the Seeed XIAO ESP32-C5 that answers Frontera's Arinst `scn20`
 requests over USB serial. Build the Bandera Android APK with [`../patcher/`](../patcher/)
 to accept the C5's fixed USB identity, `303a:1001`. Stock Frontera does not accept it.
+
+An experimental ESP32-S3 build uses the same native USB Serial/JTAG interface
+and supports **2.4 GHz only**. Its Arinst RF performance has not been validated;
+the measurements and radio tuning below describe the C5.
 
 The radio and DSP derive from [widscan58](https://github.com/CapnBry/widscan58)
 and [ESPARGOS esp-sdr](https://github.com/ESPARGOS/esp-sdr). Arinst command parsing,
@@ -47,7 +51,8 @@ accepted; malformed or oversized requests are rejected without truncating the gr
 
 This implements the app's receive subset, not the entire Arinst instrument:
 
-- Only 2400–2500 and 5150–5955 MHz are supported. Other points return −110 dBm.
+- C5 supports 2400–2500 and 5150–5955 MHz; S3 supports 2400–2500 MHz only.
+  Other points return −110 dBm.
 - The upper five sample-index bits are zero; Frontera ignores them. Consumers that
   validate Arinst's rolling sample index need additional support.
 - `200` is the requested synthesizer settling delay, **not RBW**. The C5 currently
@@ -84,13 +89,63 @@ Partial buffer allocation was also unsafe, and the command task accessed DSP
 scratch concurrently with the scanner. Buffers now allocate for the requested
 size, clean up partial failures, and remain owned by the scanner.
 
-## Build and flash
+## Download and flash a CI build
+
+In GitHub **Actions → Build ESP32 firmware → Run workflow**, select the source
+branch or tag and optionally disable the pre-release flag. The dispatch-only
+workflow builds **both** targets with the pinned toolchain, runs host tests,
+and validates the merged images before publishing release
+`firmware-<short-sha>`. Each target is also available as a workflow artifact.
+
+Download the image matching your chip:
+
+| File | Hardware |
+|---|---|
+| `bandera-esp32c5-<sha>.factory.bin` | Seeed XIAO ESP32-C5; 2.4 and 5 GHz |
+| `bandera-esp32s3-<sha>.factory.bin` | ESP32-S3 with native USB Serial/JTAG; experimental, 2.4 GHz only |
+
+Each image contains the **bootloader, partition table, and application** for the
+project's 4 MB flash layout. Use a board with at least 4 MB flash. The accompanying
+JSON records the flash settings and segment hashes; `.sha256` checksums cover the
+downloaded images. APK releases use their existing, separate `bandera-<sha>` tags.
+
+1. Connect the board's **native USB** port to desktop Chrome or Edge and close any
+   serial monitor. On S3 boards with two USB ports, use the ESP32's USB port rather
+   than the USB-to-UART bridge for normal Bandera operation.
+2. Open [espflash.app](https://espflash.app/) for C5 or S3. As checked on 2026-10-26,
+   [Spacehuhn's web flasher](https://esptool.spacehuhn.com/) supports S3 but does
+   **not** support C5; use espflash.app for C5.
+3. Select the matching `.factory.bin` and flash it at **`0x0` / `0x0000`**.
+   espflash.app uses this address automatically; set it explicitly in Spacehuhn.
+   Preserve the image's flash settings if prompted. **Flashing resets stored settings.**
+4. Reset after flashing. If automatic download mode fails, hold BOOT, press and
+   release RESET, then release BOOT and reconnect in the flasher. Connect the
+   receiver to the phone and use the Bandera APK from `../patcher/`.
+
+The C5 bootloader lives at `0x2000` inside the merged image; S3's is at `0x0`.
+Both merged files must still be written at **`0x0`**. Do not select `0x10000` for
+a factory image—that address is for the separate application binary only.
+
+These are build-validated images, not new hardware validation of every board.
+In particular, the S3 cannot receive 5.8 GHz analog video.
+
+## Build and flash locally
 
 Use **PowerShell** with pioarduino 55.03.312-1 / ESP-IDF 5.5.5:
 
 ```powershell
 & "$HOME\.platformio\penv\Scripts\pio.exe" run -e esp32c5 -d .\firmware
 & "$HOME\.platformio\penv\Scripts\pio.exe" run -e esp32c5 -t upload --upload-port COM5 -d .\firmware
+```
+
+Use `-e esp32s3` for S3. PlatformIO also produces
+`firmware/.pio/build/<target>/firmware.factory.bin`, flashable at `0x0`.
+CI installs `pioarduino==6.2.0` and builds the same environments on Ubuntu.
+To validate and package a local build (from this directory, in Git Bash):
+
+```bash
+python firmware/scripts/package_firmware.py --build-dir firmware/.pio/build/esp32c5 \
+  --target esp32c5 --version "$(git rev-parse --short=7 HEAD)" --out-dir ../build/firmware
 ```
 
 USB-Serial/JTAG hardware reset enters the downloader; no BOOT button is normally
