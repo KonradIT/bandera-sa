@@ -2,9 +2,12 @@
 #pragma once
 #include <stdbool.h>
 #include <stdint.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include "planner.h"
 #include "profile.h"
 #include "radio.h"
+#include "arinst_sweep.h"
 
 typedef struct {
     const profile_t *profile;
@@ -56,13 +59,16 @@ void scanner_get_config(scan_config_t *c);
 void scanner_set_config(const scan_config_t *c);
 void scanner_get_plan(plan_t *plan);
 
-typedef enum { SCAN_REQ_RAWIQ, SCAN_REQ_RECAL, SCAN_REQ_FFTEVAL_SYNTH, SCAN_REQ_FFTEVAL_LIVE } scan_req_type_t;
+typedef enum { SCAN_REQ_RAWIQ, SCAN_REQ_RECAL, SCAN_REQ_FFTEVAL_SYNTH, SCAN_REQ_FFTEVAL_LIVE,
+               SCAN_REQ_ARINST } scan_req_type_t;
 typedef struct {
     scan_req_type_t type;
     uint32_t lo_khz;
     uint16_t n;
     uint8_t rate_code;
     int32_t p1, p2, p3;      /* FFTEVAL parameters */
+    arinst_req_t arinst;
+    TaskHandle_t completion_task; /* optional synchronous request acknowledgement */
 } scan_request_t;
 bool scanner_request(const scan_request_t *r);
 

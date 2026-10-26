@@ -16,6 +16,7 @@
 #include "fft_eval.h"
 #include "rh.h"
 #include "scanner.h"
+#include "arinst.h"
 
 #define FLOOR_PERCENTILE 0.2f
 #define TELEMETRY_US 250000
@@ -661,12 +662,14 @@ static void scanner_task(void *arg) {
         while (xQueueReceive(requests, &req, 0) == pdTRUE) {
             sp->tuned_lo_khz = 0; /* these tune (or recalibrate) the radio themselves */
             if (req.type == SCAN_REQ_RAWIQ) do_rawiq(&req);
+            else if (req.type == SCAN_REQ_ARINST) arinst_scan(&req.arinst);
             else if (req.type == SCAN_REQ_FFTEVAL_SYNTH || req.type == SCAN_REQ_FFTEVAL_LIVE) do_fft_eval(&req);
             else if (req.type == SCAN_REQ_RECAL) {
                 radio_force_recal();
                 memset(sp->iq, 0, sizeof(sp->iq));
                 link_text("OK RECAL\n");
             }
+            if (req.completion_task) xTaskNotifyGive(req.completion_task);
         }
         int64_t now = esp_timer_get_time();
         if (now - sp->window_start >= TELEMETRY_US) emit_telemetry(now);

@@ -207,6 +207,12 @@ static void set_proto(proto_t p) {
         link_flush();
     } else {
         next.metrics_mode = METRICS_FULL;
+        if (p == PROTO_ARINST) {
+            next.running = false;
+            next.rh = false;
+            link_set_streaming(false);
+            link_flush();
+        }
     }
     scanner_set_config(&next);
     link_set_streaming(p == PROTO_MONITOR); /* Arinst/RH: off (Arinst writes its packets directly) */
@@ -246,7 +252,7 @@ static void send_status(const char *keyword) {
               "\"ema_ms\":%u,\"clear_ms\":%u,\"signal_db\":%.1f,\"avg_shift\":%u,\"spec_every\":%u,\"spec_bins\":%u,"
               "\"spec_span_hz\":%" PRIu32 ",\"spec_detector\":%u,\"fft\":\"%s\",\"level_filter\":\"%s\",\"throttle_hz\":%" PRIu32 ","
               "\"phy_idle\":%u,\"phy_idle_min_us\":%" PRIu32 ",\"plan\":[",
-              keyword, proto == PROTO_RH ? "RH" : "MONITOR", c.profile->name, c.running, c.enabled, c.mode == PLAN_GROUP ? "GROUP" : "SINGLE",
+              keyword, proto == PROTO_RH ? "RH" : proto == PROTO_ARINST ? "ARINST" : "MONITOR", c.profile->name, c.running, c.enabled, c.mode == PLAN_GROUP ? "GROUP" : "SINGLE",
               c.capture_samples, c.nfft, c.segments, c.rate_code, c.filter, c.iq_corr, c.settle_us, radio_get_tune_skip(),
               c.gain_mode == RADIO_GAIN_MANUAL ? "MANUAL" : "HARDWARE", c.gain, radio_caps()->gain_max, (unsigned)radio_caps()->max_samples,
               c.recal == RADIO_RECAL_ONCE ? "ONCE" : c.recal == RADIO_RECAL_CACHE ? "CACHE" : "EVERY",
@@ -313,7 +319,11 @@ static bool parse_channels(char *args, const profile_t *p, scan_config_t *c) {
 }
 
 static void handle(char *line) {
-    if (arinst_service(line)) return; /* Arinst scn20/test/... consumed here in any mode */
+    if (arinst_command(line)) {
+        if (proto != PROTO_ARINST) set_proto(PROTO_ARINST);
+        arinst_service(line);
+        return;
+    }
     if (proto == PROTO_RH && !rh_allowed(line)) {
         link_text("ERR rh_mode\n");
         return;
@@ -656,7 +666,7 @@ static void commands_task(void *arg) {
 void commands_task_start(void) {
     reply = malloc(REPLY_BYTES);
     if (reply) reply[0] = 0;
-    /* Boot in RotorHazard mode (rh_init has run); monitor mode starts from the defaults. */
+    /* Keep the lap-timer defaults available, but Arinst owns the radio at boot. */
     scan_config_t c;
     scanner_get_config(&c);
     other_cfg = c;
@@ -665,6 +675,10 @@ void commands_task_start(void) {
     timer_saved = timer_builtin;
     timer_saved_load();
     timer_saved_apply(&c, &timer_saved);
+    if (proto == PROTO_ARINST) {
+        c.running = false;
+        c.rh = false;
+    }
     scanner_set_config(&c);
     link_set_streaming(false);
     xTaskCreatePinnedToCore(commands_task, "cmd", 6144, NULL, 6, NULL, portNUM_PROCESSORS - 1);

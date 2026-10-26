@@ -6,9 +6,10 @@
  *
  * The Frontera app (and the real Arinst) speak this over serial:
  *   request  "scn20 {startHz} {stopHz} {stepHz} 200 {samples} 10700000 {att} {idx}\r\n"
- *   reply    "scn20 {startHz} {idx}\r\n" + big-endian 16-bit words, one per point,
+ *   reply    "\r\nscn20 {startHz} {idx}\r\n" + big-endian 16-bit words, one per point,
  *            dBm = (800 - (word & 0x7FF)) / 10, then FF FF, then "{elapsedMs}\r\ncomplete\r\n"
- * Verified byte-for-byte against the app's parser (c8/l.java) and pyarinst.
+ * Framing follows the official protocol and app parser (c8/l.java). The rolling
+ * upper-five-bit sample index and instrument controls are not emulated.
  *
  * The C5's PLL only locks near 2.4 and 5 GHz, so points outside those bands are
  * returned at a floor level; drones live in the covered bands.
@@ -19,7 +20,7 @@
 #include <stddef.h>
 
 #define ARINST_MAX_POINTS 2048
-#define ARINST_MAX_HOPS 128
+#define ARINST_MAX_HOPS 256
 #define ARINST_FLOOR_DBM (-110.0f)
 
 /* A covered tuning band, inclusive, in Hz. */
@@ -31,8 +32,9 @@ extern const int ARINST_C5_NBANDS;
 
 typedef struct {
     uint64_t start_hz, stop_hz, step_hz;
-    int points;       /* (stop-start)/step + 1, clamped to ARINST_MAX_POINTS */
+    int points;       /* (stop-start)/step + 1, validated against ARINST_MAX_POINTS */
     int index;        /* sequence index echoed back */
+    bool tracking;   /* scn22 reply tag; no tracking generator exists on the C5 */
     bool ok;
 } arinst_req_t;
 
@@ -49,17 +51,22 @@ arinst_req_t arinst_parse(const char *line);
 char arinst_command(const char *line);
 
 /* Plan the LO hops that cover the request's points which fall in a locked band.
- * rate_hz/usable_frac set each capture's usable span (usable = rate*frac, centred on LO).
+ * rate_hz/usable_frac set each capture's usable half-span edge = rate*frac/2.
+ * The C5 radio is blind within +-dead_hz of the LO (DC offset / LO leakage), so each
+ * point is served from a good sideband |off| in [dead_hz, edge-margin], never near DC,
+ * with the LO kept inside the band so the PLL locks.
  * Points outside every band get no hop (the caller leaves them at the floor).
- * Returns the number of hops (<= ARINST_MAX_HOPS); *covered = points a hop will fill. */
-int arinst_plan(const arinst_req_t *req, double rate_hz, double usable_frac,
+ * Returns the number of hops (<= max_hops); *covered = points a hop will fill. */
+int arinst_plan(const arinst_req_t *req, double rate_hz, double usable_frac, double dead_hz,
                 const arinst_band_t *bands, int nbands, arinst_hop_t *hops, int max_hops, int *covered);
 
 /* For one hop, map each of its output points to the nearest usable FFT bin and
- * write dBm into out[]. power[] holds nfft linear powers in natural FFT order
- * (bin 0 = DC = LO); a full-scale tone's bin equals tone_scale. valid[] (or NULL)
- * marks usable bins (0 near DC / out of band). dbm = 10*log10(power*tone_scale) + cal_offset.
- * Points whose nearest bin is invalid are left untouched (caller pre-fills the floor). */
+ * write dBm into out[]. power[] holds nfft linear powers in FFT-shifted order
+ * (bin nfft/2 = DC = LO), matching psd_compute. Its conjugation already
+ * corrects the radio's inverted I/Q: LO+off reads bin nfft/2+off/bin_hz.
+ * valid[] (or NULL) marks usable bins (0 near DC / out of band).
+ * dbm = 10*log10(power*tone_scale) + cal_offset. Points whose nearest bin is
+ * invalid are left untouched (caller pre-fills the floor). */
 void arinst_fill_hop(const arinst_req_t *req, const arinst_hop_t *hop, double rate_hz, int nfft,
                      const uint32_t *power, double tone_scale, const uint8_t *valid,
                      float cal_offset_db, float *out);

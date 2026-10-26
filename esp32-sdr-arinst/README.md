@@ -1,95 +1,139 @@
-# esp32-sdr-arinst — an ESP32-C5 that speaks the Arinst protocol
+# ESP32-C5 Arinst-compatible receiver
 
-Firmware that turns a **Seeed XIAO ESP32-C5** into a spectrum analyzer which talks the
-**Arinst SSA `scn20` serial protocol**, so the Frontera drone-detection app (via the
-modded bridge in `../modded_app`) uses it like a Frontera/Arinst analyzer — no tinySA,
-no external SDR.
+Firmware for the Seeed XIAO ESP32-C5 that answers Frontera's Arinst `scn20`
+requests over USB serial. Build the Bandera Android APK with [`../patcher/`](../patcher/)
+to accept the C5's fixed USB identity, `303a:1001`. Stock Frontera does not accept it.
 
-It reuses the hard-won C5 radio work from
-[CapnBry/widscan58](https://github.com/CapnBry/widscan58) (built on
-[ESPARGOS/esp-sdr](https://github.com/ESPARGOS/esp-sdr)): the undocumented raw-I/Q debug
-path, C5 tuning, radix-4 FFT, IQ-image correction, and a measured dBFS→dBm calibration.
-On top of that this project adds an Arinst protocol + sweep layer (`firmware/src/arinst/`).
+The radio and DSP derive from [widscan58](https://github.com/CapnBry/widscan58)
+and [ESPARGOS esp-sdr](https://github.com/ESPARGOS/esp-sdr). Arinst command parsing,
+grid planning, and reply encoding live in `firmware/src/arinst/`.
+GPL-3.0-or-later; upstream files retain their attribution.
 
-GPL-3.0-or-later; files derived from widscan58/esp-sdr keep their headers.
+## Receive and serial path
 
-## How it works
+1. Frontera requests a grid, normally 600 points spaced 3 MHz apart. Its discovery
+   request is only 11 points at 100–200 MHz; these correctly return the C5 floor.
+2. The command task queues each sweep to the scanner task and waits for completion.
+   The scanner exclusively owns the radio and PSD buffers. Replies share the USB
+   output queue, so other command replies cannot split a binary sweep packet.
+3. A hop captures 4096 I/Q samples at 80 MS/s and averages four Hann-windowed
+   1024-point spectra. Bin spacing is 78.125 kHz and Hann equivalent noise bandwidth
+   is approximately 117.2 kHz. This is an SDR measurement approximation, not a
+   reproduction of an Arinst's analog IF filter or detector.
+4. The planner uses whole-MHz LOs and only offsets 7–15 MHz from the LO, inside the
+   retained ±16 MHz passband. A full 4200–5997 MHz request needs about 90 hops.
+   The 80 MS/s capture avoids the earlier nearby-carrier alias problem at 40 MS/s.
+5. DC/IQ calibration runs once per supported band in each sweep. The RX gain table
+   still follows **every LO**; gain is not pinned to one frequency. This avoids
+   thrashing the 16-entry per-LO calibration cache on a wide scan.
+6. `psd_compute` has already conjugated the radio's inverted raw I/Q and returns
+   **FFT-shifted** bins. Read frequency `f` at `N/2 + round((f-LO)/(rate/N))`.
+   Do not conjugate or mirror it again. Hardware raw-IQ captures at three LOs
+   independently confirmed the 5805 MHz camera's orientation.
 
+The wire exchange is:
+
+```text
+request: scn20 START STOP STEP 200 SAMPLES 10700000 ATT INDEX\r\n
+reply:   \r\nscn20 START INDEX\r\n
+         [N big-endian u16 words] FF FF ELAPSED_MS\r\ncomplete\r\n
+level:   (800 - (word & 0x07ff)) / 10 dBm
 ```
-Frontera app --scn20--> USB-Serial/JTAG --> arinst.c --> radio_tune + radio_capture + psd_compute
-            <--packet--                                   (widscan58 C5 radio core)
-```
 
-1. The app sends `scn20 <start> <stop> <step> 200 <samples> 10700000 <att> <idx>`.
-2. `arinst_plan` (host-tested, `firmware/src/arinst/arinst_sweep.c`) tiles the requested
-   band with LO hops of ~32 MHz (40 MS/s × 0.8 usable), but only where the C5's PLL locks.
-3. Each hop: `radio_tune` → `radio_capture` → `psd_compute` → map FFT bins to the Arinst
-   3 MHz grid → dBFS + calibration → dBm.
-4. `arinst_build_packet` emits the exact Arinst reply: `scn20 <start> <idx>\r\n`, big-endian
-   16-bit words (`dBm = (800 − word&0x7FF)/10`), `FF FF`, `<elapsed>\r\ncomplete\r\n`.
-   Verified byte-for-byte against the app's parser and pyarinst.
+The leading CRLF follows the [official Arinst protocol](https://www.arinst.net/files/Protocol.zip).
+`scn22` returns a matching `scn22` header but has no tracking-generator hardware.
+`test` returns `test 0 complete 0\r\n`. One-point sweeps and up to 2048 points are
+accepted; malformed or oversized requests are rejected without truncating the grid.
 
-## Two hard constraints (both from the C5 silicon)
+This implements the app's receive subset, not the entire Arinst instrument:
 
-- **Coverage is 2.4 GHz and ~5.15–5.95 GHz only.** The C5 PLL locks near 2.4 and 5 GHz, so
-  points outside those bands come back at a floor level. That still covers the FPV / drone
-  bands (2.4 GHz and 5.8 GHz), which is the point. The 5 GHz range matches widscan58's proven
-  FPV sweep; known board spurs (5600/5712/5760/5920 MHz) are handled by the radio core.
-- **USB identity cannot be faked.** The C5 has only a USB-Serial/JTAG controller (no USB-OTG),
-  so its VID/PID is fixed at Espressif `303a:1001` and TinyUSB/custom descriptors are impossible.
-  The device therefore cannot impersonate a real Arinst (`0483:5740`), so the **stock** Frontera
-  app will not open it. The **modded** app (`../modded_app`) is extended to accept `303a:1001`
-  as an analyzer (device_filter + the manufacturer shim); the C5 speaks Arinst natively, so no
-  protocol translation is needed on the phone (unlike the tinySA).
+- Only 2400–2500 and 5150–5955 MHz are supported. Other points return −110 dBm.
+- The upper five sample-index bits are zero; Frontera ignores them. Consumers that
+  validate Arinst's rolling sample index need additional support.
+- `200` is the requested synthesizer settling delay, **not RBW**. The C5 currently
+  uses a fixed 100 µs minimum settle and the capture settings above. Requested ADC
+  sample count, IF, and attenuation are parsed but do not configure equivalent
+  Arinst hardware. Frontera uses attenuation code `10000` (0 dB).
+- There is no tracking generator or calibrated attenuator. Generator commands do
+  not enable a transmitter.
+- The dBFS-to-dBm offset remains an uncalibrated −30 dB. Absolute levels should not
+  be treated as calibrated RF power. Internal board spurs, including 5760 MHz,
+  can remain visible.
 
-## Status
+## Hardware validation (2026-10-26)
 
-- **Sweep/packet logic: host-tested and passing** (`firmware/test/test_arinst_sweep.c`): a
-  synthetic 5843 MHz carrier round-trips to −40 dBm through the app's own parser, in-band floor
-  to −100 dBm, out-of-band to the clamp.
-- **Firmware: builds on the widscan58 base**; wired as the default `PROTO_ARINST` protocol.
-- **Not yet done:** flash to a real XIAO C5 and confirm RF (needs the board) + a power
-  calibration (`arinst_set_cal`, currently a placeholder; detection is floor-relative so the
-  absolute offset barely matters, but set it with widscan58's `tools/powercal.py` for real dBm).
+On the connected XIAO ESP32-C5, with an analog FPV camera on A4 (nominal 5805 MHz):
 
-## Build
+- Full 600-point 4200–5997 MHz sweeps completed in **377–378 ms** on the device,
+  within Frontera's 2000 ms scan timeout. The camera appeared at 5805/5808 MHz.
+- Replaying 24 consecutive sweeps through the unchanged extracted model detected
+  analog near the camera in every sliding window: 17/17 at W=8, 15/15 at W=10,
+  13/13 at W=12, and 9/9 at W=16. This validates this bench target, not other drones.
+- A 600-point 2200–3997 MHz request completed in **52–53 ms**, measuring 34 points
+  at 2401–2500 MHz. Ambient bursts were present; DJI validation remains pending.
+- A 47-request sequence passed discovery, one-point, `scn22`, 2048-point, and 40
+  alternating 2.4/5 GHz requests without a crash or malformed packet.
+- A follow-up Pixel 10 / Android 17 test displayed live spectrum/waterfall and
+  confirmed analog near 5806 MHz. USB reconnect and stop/start recovered correctly.
+  Additional labels elsewhere in the band were not verified against known sources;
+  this is an integration check, not a false-positive-rate measurement.
 
-pioarduino 55.03.312-1 (ESP-IDF 5.5.5, PlatformIO Core 6.2.x). Run from PowerShell — pioarduino's
-`idf_tools.py` refuses Git Bash.
+The previous empty-sweep regression had two independent frequency-index errors:
+natural-order indexing of FFT-shifted PSD data, and a second spectral reversal.
+Partial buffer allocation was also unsafe, and the command task accessed DSP
+scratch concurrently with the scanner. Buffers now allocate for the requested
+size, clean up partial failures, and remain owned by the scanner.
+
+## Build and flash
+
+Use **PowerShell** with pioarduino 55.03.312-1 / ESP-IDF 5.5.5:
 
 ```powershell
-cd firmware
-pio run -e esp32c5                 # build
-pio run -e esp32c5 -t upload       # flash the XIAO C5 over its native USB
+& "$HOME\.platformio\penv\Scripts\pio.exe" run -e esp32c5 -d .\firmware
+& "$HOME\.platformio\penv\Scripts\pio.exe" run -e esp32c5 -t upload --upload-port COM5 -d .\firmware
 ```
 
-If upload stalls: hold BOOT, tap RESET, release BOOT, then upload (widscan58's flashing notes
-apply; the C5 bootloader is at 0x2000).
+USB-Serial/JTAG hardware reset enters the downloader; no BOOT button is normally
+needed. The board tested reports 8 MB flash, while the project deliberately uses
+the existing 4 MB board definition and partition layout.
 
-Host test of the sweep logic (no board):
+The local pioarduino installation can repeatedly warn that `tool-esptoolpy` lacks
+`pyproject.toml`/`setup.py`; builds and uploads still completed. Installing
+`esptool==5.4.0` into its `.espidf-5.5.5` environment provides the working module,
+but does not repair the incomplete tool-package directory or eliminate its warning.
+Use PowerShell for this environment; `idf_tools.py` rejects Git Bash.
 
-```sh
-gcc -std=c11 -Wall -Isrc/arinst -o t firmware/test/test_arinst_sweep.c firmware/src/arinst/arinst_sweep.c -lm && ./t
+Host regression test, from this directory in Git Bash:
+
+```bash
+gcc -std=c11 -Wall -Wextra -Werror -Ifirmware/src/arinst -O2 \
+  -o /tmp/bandera-arinst-test firmware/test/test_arinst_sweep.c \
+  firmware/src/arinst/arinst_sweep.c -lm
+/tmp/bandera-arinst-test
 ```
 
-## Using it with the phone
+Tests cover strict request parsing, complete supported-band coverage, independent
+40/80 MS/s shifted-PSD fixtures, single-point scans, official reply framing, exact
+buffer bounds, and round trips through a client decoder. Expected result: `ALL PASSED`.
 
-1. Flash the C5.
-2. Install the modded app (`../modded_app/build/signed/patched+bridge-aligned-debugSigned.apk`),
-   which accepts `303a:1001`.
-3. Plug the C5 into the phone (USB-C). The XIAO C5 is self-powered and low-draw, unlike the tinySA.
-4. Tap "OK" on the "Open Frontera?" prompt; scan the 2.4 or 5.8 GHz band.
+## Phone and antenna
 
-## External antenna (XIAO ESP32-C5)
+Install an APK produced by `../patcher/`, connect the C5 over USB-C, and grant the
+USB permission. Choose the 2.4 or 5.8 GHz band. The C5 cannot change its USB VID/PID,
+so stock Frontera still needs the Bandera compatibility patch.
 
-The XIAO C5 has an onboard antenna and a u.FL connector selected by a board RF switch. Confirm
-the switch GPIO from Seeed's schematic and set it with the firmware's GPIO output (persisted),
-the same mechanism widscan58 uses for antenna switches, before relying on the external antenna.
+The XIAO's onboard antenna and u.FL path are selected by a board RF switch. Check
+the Seeed schematic before changing its GPIO selection; monitor-mode GPIO settings
+can persist in NVS.
 
-## Layout
+## Reference limits
 
-- `firmware/src/arinst/` — **new**: Arinst protocol + sweep (`arinst.c` glue, `arinst_sweep.c` pure logic).
-- `firmware/src/radio/`, `dsp/`, `proto/` — from widscan58 (C5 radio, FFT/PSD, USB-Serial/JTAG link).
-- `firmware/src/proto/commands.c` — extended: `PROTO_ARINST` is the default; `scn20`/`test`/… route to `arinst_service`.
-- `firmware/test/` — host test of the sweep logic.
-- `reference/` — upstream esp-sdr and widscan58 checkouts (not tracked).
+[C5VRX](https://github.com/Twotoz/C5VRX) is useful for physical gain-stage behavior,
+DC calibration, and the warning that private PHY calls must match the exact PHY
+library. Its current receiver uses a different ESP-IDF/PHY revision and a continuous
+video-demodulation path. Those register settings are not interchangeable with this
+project's pinned snapshot receiver. No C5VRX private-register tuning was copied.
+
+`reference/` holds ignored upstream checkouts; build artifacts and captures are
+ignored too. The firmware sources and `../patcher/overlay/` are canonical, not
+the disposable `../modded_app/` directory.

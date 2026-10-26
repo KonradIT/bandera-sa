@@ -35,7 +35,7 @@ typedef struct {
     float enbw_bins;        /* N * sum(w^2) / sum(w)^2 (1.5 for Hann) */
     unsigned saturated;     /* samples at the ADC rails */
     float dc_i, dc_q;       /* mean raw I/Q (LO leakage / DC offset), counts */
-    uint32_t *p;            /* nfft bins, natural order; linear power = p[k] * scale */
+    uint32_t *p;            /* FFT-shifted bins, DC at nfft/2; linear power = p[k] * scale */
     float scale;            /* tone-normalised: a full-scale tone's bin -> 1.0 */
     uint8_t *valid;         /* bins usable for metrics */
     uint32_t prep_us, fft_us, power_us; /* time breakdown */
