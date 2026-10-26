@@ -1,0 +1,17 @@
+# modded_app is a local working area (fresh APK decode, tools, builds). The reproducible
+# inputs live in patcher/ (patch.py + overlay/); CI regenerates everything else.
+modded_app/
+
+# Patcher / CI scratch at the repo root.
+tools/
+build/
+*.apk
+frontera.apk
+
+# Python
+__pycache__/
+*.pyc
+
+# OS
+.DS_Store
+Thumbs.db
