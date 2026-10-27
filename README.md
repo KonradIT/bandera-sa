@@ -23,6 +23,10 @@ Thanks to amoswap and tt_125!!
 
 **Modified ~~Front~~Bandera app detecting Analog FPV video using the ESP32-C5 based SDR over USB**
 
+## Explainer:
+
+[How Frontera sees drones](https://claude.ai/artifact/M3b9o3NQPonTLSmqiPthui)
+
 ## Background: Frontera / NPO Apogei
 
 **NPO Apogei** (НПО «Апогей») is a russian company that sells ["Frontera-ML": a free Android app that
